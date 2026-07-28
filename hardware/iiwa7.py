@@ -1,4 +1,6 @@
 import threading
+from dataclasses import dataclass
+from enum import Enum
 
 import numpy as np
 
@@ -21,6 +23,7 @@ from pydrake.all import (
     Multiplexer,
     DrakeLcmInterface,
     DrakeLcm,
+    Saturation,
     LcmInterfaceSystem,
     LeafSystem,
 )
@@ -160,6 +163,39 @@ class IiwaRobot(Diagram):
         builder.BuildInto(self)
 
 
+class JointVelocityController(Diagram):
+    """
+    Clips desired joint velocities to joint velocity limits.
+    """
+
+    def __init__(
+        self,
+        max_velocity: float | list[float],
+        num_joints: int = 7,
+    ):
+        super().__init__()
+
+        max_velocity = np.asarray(max_velocity, dtype=float)
+        if max_velocity.ndim == 0:
+            max_velocity = np.full(num_joints, float(max_velocity))
+        assert max_velocity.shape == (num_joints,)
+
+        builder = DiagramBuilder()
+
+        saturation = builder.AddSystem(
+            Saturation(
+                min_value=-max_velocity,
+                max_value=max_velocity,
+            )
+        )
+
+        builder.ExportInput(saturation.get_input_port(), "desired_velocity")
+
+        builder.ExportOutput(saturation.get_output_port(), "commanded_velocity")
+
+        builder.BuildInto(self)
+
+
 class JointPositionController(LeafSystem):
     """
     The JointPositionController takes as input desired joint positions, and produces a
@@ -172,15 +208,13 @@ class JointPositionController(LeafSystem):
     def __init__(
         self,
         time_step: float,
+        max_velocity: float | list[float],
         num_joints: int = 7,
-        max_velocity=1.0,
     ):
         super().__init__()
         self._num_joints = num_joints
         self._time_step = time_step
 
-        # Allow either a scalar (same limit for every joint) or a
-        # per-joint array of velocity limits (rad/s).
         max_velocity = np.asarray(max_velocity, dtype=float)
         if max_velocity.ndim == 0:
             max_velocity = np.full(num_joints, float(max_velocity))
@@ -202,8 +236,8 @@ class JointPositionController(LeafSystem):
         position = self.position_input_port.Eval(context)
         desired_position = self.desired_position_input_port.Eval(context)
 
-        mask = np.isnan(desired_position)
-        desired_position[mask] = position[mask]
+        if np.any(np.isnan(desired_position)):
+            desired_position = position
 
         velocity = np.clip(
             (desired_position - position) / self._time_step,
@@ -231,8 +265,8 @@ class IntegratedVelocityController(LeafSystem):
         self,
         time_step: float,
         num_joints: int = 7,
-        joint_lower_limit=-np.inf,
-        joint_upper_limit=np.inf,
+        joint_lower_limit: float | list[float] = -np.inf,
+        joint_upper_limit: float | list[float] = np.inf,
     ):
         super().__init__()
 
@@ -264,7 +298,7 @@ class IntegratedVelocityController(LeafSystem):
 
         state_index = self.DeclareDiscreteState(num_joints)
 
-        self.DeclareStateOutputPort("commanded_position", state_index)
+        self.DeclareStateOutputPort("position", state_index)
 
         self.DeclareInitializationDiscreteUpdateEvent(
             self._InitializeState
@@ -291,21 +325,36 @@ class IntegratedVelocityController(LeafSystem):
         discrete_state.set_value(q_next)
 
 
+class IiwaOperatingMode(Enum):
+    JOINT_VEL = "joint_vel"
+    JOINT_POS = "joint_pos"
+
+
 class IiwaRosInterface(Node):
-    def __init__(self, namespace):
+    def __init__(self, namespace: str, operating_mode: IiwaOperatingMode):
         super().__init__(namespace)
 
         self._lock = threading.Lock()
 
-        self._desired_position = np.full(7, np.nan)
+        self._command_value = None
         self._new_command = False
 
-        self.create_subscription(
-            JointState,
-            f"/{namespace}/cmd_joint_pos",
-            self._command_callback,
-            1,
-        )
+        if operating_mode == IiwaOperatingMode.JOINT_VEL:
+            self.create_subscription(
+                JointState,
+                f"/{namespace}/cmd_joint_vel",
+                self._CmdJointVelCallback,
+                1,
+            )
+        elif operating_mode == IiwaOperatingMode.JOINT_POS:
+            self.create_subscription(
+                JointState,
+                f"/{namespace}/cmd_joint_pos",
+                self._CmdJointPosCallback,
+                1,
+            )
+        else:
+            raise ValueError(f'Invalid control mode {operating_mode}')
 
         self._joint_state_pub = self.create_publisher(
             JointState,
@@ -313,22 +362,37 @@ class IiwaRosInterface(Node):
             10,
         )
 
-    def _command_callback(self, msg: JointState):
+    def _CmdJointPosCallback(self, msg: JointState):
         if len(msg.position) != 7:
-            self.get_logger().warn("Expected 7 joint positions.")
+            self.get_logger().warn(f"Expected 7 joint positions, got {np.array(msg.position)}")
             return
 
         with self._lock:
-            self._desired_position = np.array(msg.position)
+            self._command_value = np.array(msg.position)
             self._new_command = True
+            self.get_logger().info(f"Received joint position command {self._command_value}")
 
-    def consume_command(self):
+    def _CmdJointVelCallback(self, msg: JointState):
+        if len(msg.velocity) != 7:
+            self.get_logger().warn(f"Expected 7 joint velocities, got {np.array(msg.velocity)}")
+            return
+
         with self._lock:
-            q = self._desired_position.copy()
-            new = self._new_command
+            self._command_value = np.array(msg.velocity)
+            self._new_command = True
+            self.get_logger().info(f"Received joint velocity command {self._command_value}")
+
+    def ConsumeCommand(self):
+        with self._lock:
+            command_value = (
+                self._command_value.copy()
+                if self._command_value is not None
+                else None
+            )
+            new_command = self._new_command
             self._new_command = False
 
-        return q, new
+        return command_value, new_command
 
     def publish_joint_state(
         self,
@@ -348,25 +412,34 @@ class IiwaRosInterface(Node):
         self._joint_state_pub.publish(msg)
 
 
-class RosCommandSource(LeafSystem):
+class RosJointPositionSource(LeafSystem):
     def __init__(self, ros_interface):
         super().__init__()
 
-        self._ros = ros_interface
-        self._command = np.zeros(7)
+        self._ros_interface = ros_interface
 
-        self.DeclareVectorOutputPort(
-            "desired_position",
-            7,
-            self._calc_output,
-        )
+        self.DeclareVectorOutputPort("desired_position", 7, self._CalcOutput)
 
-    def _calc_output(self, context, output):
-        q, new = self._ros.consume_command()
+    def _CalcOutput(self, context, output):
+        qpos, new = self._ros_interface.ConsumeCommand()
+        if qpos is None:
+            qpos = np.full(7, np.nan)
+        output.SetFromVector(qpos)
 
-        self._command = q
 
-        output.SetFromVector(q)
+class RosJointVelocitySource(LeafSystem):
+    def __init__(self, ros_interface):
+        super().__init__()
+
+        self._ros_interface = ros_interface
+
+        self.DeclareVectorOutputPort("desired_velocity", 7, self._CalcOutput)
+
+    def _CalcOutput(self, context, output):
+        qvel, new = self._ros_interface.ConsumeCommand()
+        if qvel is None:
+            qvel = np.zeros(7)
+        output.SetFromVector(qvel)
 
 
 class Iiwa7System(Diagram):
@@ -374,8 +447,9 @@ class Iiwa7System(Diagram):
         self,
         lcm: DrakeLcmInterface,
         ros_interface: IiwaRosInterface,
+        operating_mode: IiwaOperatingMode,
+        max_joint_velocity: float | list[float],
         time_step: float,
-        max_joint_velocity = 1.0,
         lcm_channel_suffix: str = "",
         joint_upper_limit = np.deg2rad(np.array([170, 120, 170, 120, 170, 120, 175])),
         joint_lower_limit = np.deg2rad(-np.array([170, 120, 170, 120, 170, 120, 175])),
@@ -391,19 +465,6 @@ class Iiwa7System(Diagram):
                 control_mode=IiwaControlMode.kPositionAndTorque,
             )
         )
-
-        controller = builder.AddSystem(
-            JointPositionController(
-                time_step=time_step,
-                max_velocity=max_joint_velocity,
-            )
-        )
-
-        command_source = builder.AddSystem(
-            RosCommandSource(ros_interface)
-        )
-
-
         integrated_velocity = builder.AddSystem(
             IntegratedVelocityController(
                 time_step=time_step,
@@ -412,43 +473,76 @@ class Iiwa7System(Diagram):
             )
         )
         builder.Connect(
-            controller.GetOutputPort("commanded_velocity"),
-            integrated_velocity.GetInputPort("velocity"),
+            integrated_velocity.GetOutputPort("position"),
+            robot.GetInputPort("position"),
         )
-
         builder.Connect(
             robot.GetOutputPort("position_measured"),
             integrated_velocity.GetInputPort("initial_position"),
         )
 
-        builder.Connect(
-            integrated_velocity.GetOutputPort("commanded_position"),
-            robot.GetInputPort("position"),
-        )
+        if operating_mode == IiwaOperatingMode.JOINT_VEL:
+            controller = builder.AddSystem(
+                JointVelocityController(max_velocity=max_joint_velocity)
+            )
+            command_source = builder.AddSystem(
+                RosJointVelocitySource(ros_interface)
+            )
+            builder.Connect(
+                command_source.get_output_port(),
+                controller.GetInputPort("desired_velocity"),
+            )
+
+        elif operating_mode == IiwaOperatingMode.JOINT_POS:
+            controller = builder.AddSystem(
+                JointPositionController(
+                    time_step=time_step,
+                    max_velocity=max_joint_velocity,
+                )
+            )
+            command_source = builder.AddSystem(
+                RosJointPositionSource(ros_interface)
+            )
+            builder.Connect(
+                integrated_velocity.GetOutputPort("position"),
+                controller.GetInputPort("position"),
+            )
+            builder.Connect(
+                command_source.get_output_port(),
+                controller.GetInputPort("desired_position"),
+            )
+
+        else:
+            raise ValueError(f'Invalid operating mode {operating_mode}')
 
         builder.Connect(
-            integrated_velocity.GetOutputPort("commanded_position"),
-            controller.GetInputPort("position"),
-        )
-
-        builder.Connect(
-            command_source.get_output_port(),
-            controller.GetInputPort("desired_position"),
+            controller.GetOutputPort("commanded_velocity"),
+            integrated_velocity.GetInputPort("velocity"),
         )
 
         builder.BuildInto(self)
 
 
+@dataclass
+class Iiwa7SystemsConfig:
+    operating_mode: IiwaOperatingMode
+    max_joint_velocity: float | list[float] = 1.0
+    time_step: float = 0.005
+
+
 def AddIiwa7Systems(
     diagram_builder: DiagramBuilder,
     rclpy_executor: rclpy.executors.Executor,
-    ros_namespace: str = "left_arm",
-    lcm_channel_suffix: str = "",
-    time_step: float = 0.005,
+    config: Iiwa7SystemsConfig,
 ) -> None:
 
-    ros_interface = IiwaRosInterface(namespace=ros_namespace)
+    ros_namespace = "left_arm"
+    lcm_channel_suffix = ""
 
+    ros_interface = IiwaRosInterface(
+        namespace=ros_namespace,
+        operating_mode=config.operating_mode,
+    )
     rclpy_executor.add_node(ros_interface)
 
     lcm = AddLcm(diagram_builder)
@@ -457,7 +551,9 @@ def AddIiwa7Systems(
         Iiwa7System(
             lcm=lcm,
             ros_interface=ros_interface,
-            time_step=time_step,
+            operating_mode=config.operating_mode,
+            max_joint_velocity=config.max_joint_velocity,
+            time_step=config.time_step,
             lcm_channel_suffix=lcm_channel_suffix,
         )
     )
