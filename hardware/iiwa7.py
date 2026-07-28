@@ -1,3 +1,4 @@
+import copy
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -26,11 +27,28 @@ from pydrake.all import (
     Saturation,
     LcmInterfaceSystem,
     LeafSystem,
+    BusCreator,
+    RigidTransform,
+    AbstractValue,
+    DifferentialInverseKinematicsSystem,
+    RobotDiagramBuilder,
+    SceneGraphCollisionChecker,
+    Parser,
+    CollisionCheckerParams,
+    SpatialVelocity,
+    DofMask,
+    RotationMatrix,
+    Quaternion,
+    ConstantVectorSource,
+    JointLimits,
+    InputPortIndex,
+    PortSwitch,
 )
 
 import rclpy
 from rclpy.node import Node
 
+from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 
 
@@ -326,9 +344,219 @@ class JointPositionController(LeafSystem):
         output.SetFromVector(velocity)
 
 
+def Iiwa7DifferentialInverseKinematics(
+        time_step: float,
+        max_linear_velocity: float | list[float],
+        max_angular_velocity: float | list[float],
+    ) -> tuple[DifferentialInverseKinematicsSystem, str]:
+
+    if np.isscalar(max_linear_velocity):
+        max_linear_velocity = np.ones(3) * max_linear_velocity / np.sqrt(3)
+    if np.isscalar(max_angular_velocity):
+        max_angular_velocity = np.ones(3) * max_angular_velocity / np.sqrt(3)
+    max_cartesian_velocity = np.concatenate([max_angular_velocity, max_linear_velocity])
+
+    robot_builder = RobotDiagramBuilder()
+
+    plant = robot_builder.plant()
+
+    iiwa_instance = Parser(plant).AddModelsFromUrl(
+        "package://drake_models/iiwa_description/sdf/iiwa7_no_collision.sdf"
+    )[0]
+
+
+    plant.WeldFrames(
+        plant.world_frame(),
+        plant.GetFrameByName("iiwa_link_0", iiwa_instance),
+        RigidTransform(),
+    )
+
+    robot_diagram = robot_builder.Build()
+
+    plant = robot_diagram.plant()
+
+    collision_checker = SceneGraphCollisionChecker(
+        CollisionCheckerParams(
+            model=robot_diagram,
+            robot_model_instances=[iiwa_instance],
+            edge_step_size=1.0,
+        )
+    )
+
+    ee_frame = plant.GetFrameByName("iiwa_link_7").scoped_name().get_full()
+    task_frame = plant.world_frame().scoped_name().get_full()
+
+    cartesian_axis_masks = { ee_frame: np.ones(6) }
+
+    assert plant.num_positions() == 7
+    active_dof = DofMask(plant.num_positions(), True)
+
+    recipe = DifferentialInverseKinematicsSystem.Recipe()
+    recipe.AddIngredient(
+        DifferentialInverseKinematicsSystem.LeastSquaresCost(
+            DifferentialInverseKinematicsSystem.LeastSquaresCost.Config(
+                cartesian_qp_weight=1.0,
+                cartesian_axis_masks=cartesian_axis_masks,
+            )
+        )
+    )
+    recipe.AddIngredient(
+        DifferentialInverseKinematicsSystem.JointCenteringCost(
+            DifferentialInverseKinematicsSystem.JointCenteringCost.Config(
+                posture_gain=1.0,
+                cartesian_axis_masks=cartesian_axis_masks,
+            )
+        )
+    )
+    recipe.AddIngredient(
+        DifferentialInverseKinematicsSystem.CartesianVelocityLimitConstraint(
+            DifferentialInverseKinematicsSystem.CartesianVelocityLimitConstraint.Config(
+                V_next_TG_limit=max_cartesian_velocity
+            )
+        )
+    )
+    recipe.AddIngredient(
+        DifferentialInverseKinematicsSystem.JointVelocityLimitConstraint(
+            DifferentialInverseKinematicsSystem.JointVelocityLimitConstraint.Config(),
+            JointLimits(plant, active_dof)
+        )
+    )
+
+    diff_ik_system = DifferentialInverseKinematicsSystem(
+        recipe=recipe,
+        task_frame=task_frame,
+        collision_checker=collision_checker,
+        active_dof=active_dof,
+        time_step=time_step,
+        K_VX=1.0,
+        Vd_TG_limit=SpatialVelocity(max_cartesian_velocity),
+    )
+
+    return diff_ik_system, ee_frame
+
+
+class CartesianPoseController(Diagram):
+    """
+    The CartesianPoseController converts desired end-effector poses into joint
+    velocity commands using Differential Inverse Kinematics. If the desired pose
+    is invalid (contains NaN values), the controller outputs zero joint
+    velocities.
+    """
+
+    def __init__(
+        self,
+        time_step: float,
+        max_linear_velocity: float | list[float],
+        max_angular_velocity: float | list[float],
+    ):
+        super().__init__()
+
+        builder = DiagramBuilder()
+
+        diff_ik, ee_frame = Iiwa7DifferentialInverseKinematics(
+            time_step=time_step,
+            max_linear_velocity=max_linear_velocity,
+            max_angular_velocity=max_angular_velocity,
+        )
+
+        diff_ik = builder.AddSystem(diff_ik)
+
+        pose_bus = BusCreator()
+        pose_bus.DeclareAbstractInputPort(
+            ee_frame,
+            AbstractValue.Make(RigidTransform())
+        )
+        pose_bus = builder.AddSystem(pose_bus)
+
+        zero_position = builder.AddSystem(ConstantVectorSource(np.zeros(7)))
+
+        builder.Connect(
+            pose_bus.get_output_port(),
+            diff_ik.GetInputPort("desired_cartesian_poses"),
+        )
+
+        builder.Connect(
+            zero_position.get_output_port(),
+            diff_ik.GetInputPort("nominal_posture"),
+        )
+
+        builder.ExportInput(
+            diff_ik.GetInputPort("position"),
+            "position",
+        )
+
+        builder.ExportInput(
+            pose_bus.GetInputPort(ee_frame),
+            "desired_pose",
+        )
+
+
+        class PoseSelector(LeafSystem):
+            def __init__(self):
+                super().__init__()
+
+                self.DeclareAbstractInputPort(
+                    "pose",
+                    AbstractValue.Make(RigidTransform()),
+                )
+
+                self.DeclareAbstractOutputPort(
+                    "selector",
+                    lambda: AbstractValue.Make(InputPortIndex(2)),
+                    self._CalcOutput,
+                )
+
+            def _CalcOutput(self, context, output):
+                pose = self.get_input_port().Eval(context)
+
+                invalid = (
+                    np.isnan(pose.translation()).any()
+                    or np.isnan(pose.rotation().matrix()).any()
+                )
+
+                output.set_value(InputPortIndex(2 if invalid else 1))
+
+        pose_selector = builder.AddSystem(PoseSelector())
+
+        builder.ConnectToSame(
+            pose_bus.GetInputPort(ee_frame),
+            pose_selector.get_input_port(),
+        )
+
+        switch = PortSwitch(7)
+        switch.DeclareInputPort("velocity_1")
+        switch.DeclareInputPort("velocity_2")
+        switch = builder.AddSystem(switch)
+
+        zero_velocity = builder.AddSystem(ConstantVectorSource(np.zeros(7)))
+
+        builder.Connect(
+            pose_selector.get_output_port(),
+            switch.get_port_selector_input_port(),
+        )
+
+        builder.Connect(
+            diff_ik.GetOutputPort("commanded_velocity"),
+            switch.get_input_port(1),
+        )
+
+        builder.Connect(
+            zero_velocity.get_output_port(),
+            switch.get_input_port(2),
+        )
+
+        builder.ExportOutput(
+            switch.get_output_port(),
+            "commanded_velocity",
+        )
+
+        builder.BuildInto(self)
+
+
 class IiwaOperatingMode(Enum):
     JOINT_VEL = "joint_vel"
     JOINT_POS = "joint_pos"
+    CARTESIAN_POS = "cartesian_pos"
 
 
 class IiwaRosInterface(Node):
@@ -354,6 +582,13 @@ class IiwaRosInterface(Node):
                 self._CmdJointPosCallback,
                 1,
             )
+        elif operating_mode == IiwaOperatingMode.CARTESIAN_POS:
+            self.create_subscription(
+                PoseStamped,
+                f"/{namespace}/cmd_cartesian_pos",
+                self._CmdCartesianPosCallback,
+                1,
+            )
         else:
             raise ValueError(f'Invalid control mode {operating_mode}')
 
@@ -362,16 +597,6 @@ class IiwaRosInterface(Node):
             f"/{namespace}/joint_states",
             10,
         )
-
-    def _CmdJointPosCallback(self, msg: JointState):
-        if len(msg.position) != 7:
-            self.get_logger().warn(f"Expected 7 joint positions, got {np.array(msg.position)}")
-            return
-
-        with self._lock:
-            self._command_value = np.array(msg.position)
-            self._new_command = True
-            self.get_logger().info(f"Received joint position command {self._command_value}")
 
     def _CmdJointVelCallback(self, msg: JointState):
         if len(msg.velocity) != 7:
@@ -383,13 +608,33 @@ class IiwaRosInterface(Node):
             self._new_command = True
             self.get_logger().info(f"Received joint velocity command {self._command_value}")
 
+    def _CmdJointPosCallback(self, msg: JointState):
+        if len(msg.position) != 7:
+            self.get_logger().warn(f"Expected 7 joint positions, got {np.array(msg.position)}")
+            return
+
+        with self._lock:
+            self._command_value = np.array(msg.position)
+            self._new_command = True
+            self.get_logger().info(f"Received joint position command {self._command_value}")
+
+    def _CmdCartesianPosCallback(self, msg: PoseStamped):
+        p = msg.pose
+
+        translation = np.array([p.position.x, p.position.y, p.position.z])
+
+        quaternion = Quaternion(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z)
+
+        X_WT = RigidTransform(RotationMatrix(quaternion), translation)
+
+        with self._lock:
+            self._command_value = X_WT
+            self._new_command = True
+            self.get_logger().info(f"Received cartesian pose command {self._command_value}")
+
     def ConsumeCommand(self):
         with self._lock:
-            command_value = (
-                self._command_value.copy()
-                if self._command_value is not None
-                else None
-            )
+            command_value = copy.copy(self._command_value)
             new_command = self._new_command
             self._new_command = False
 
@@ -443,6 +688,25 @@ class RosJointVelocitySource(LeafSystem):
         output.SetFromVector(qvel)
 
 
+class RosCartesianPoseSource(LeafSystem):
+    def __init__(self, ros_interface):
+        super().__init__()
+
+        self._ros_interface = ros_interface
+
+        self.DeclareAbstractOutputPort(
+            "desired_pose",
+            lambda: AbstractValue.Make(RigidTransform()),
+            self._CalcOutput,
+        )
+
+    def _CalcOutput(self, context, output):
+        pose, new = self._ros_interface.ConsumeCommand()
+        if pose is None:
+            pose = RigidTransform(np.full(3, np.nan))
+        output.set_value(pose)
+
+
 class Iiwa7System(Diagram):
     def __init__(
         self,
@@ -450,6 +714,8 @@ class Iiwa7System(Diagram):
         ros_interface: IiwaRosInterface,
         operating_mode: IiwaOperatingMode,
         max_joint_velocity: float | list[float],
+        max_linear_velocity: float | list[float],
+        max_angular_velocity: float | list[float],
         time_step: float,
         lcm_channel_suffix: str = "",
         joint_upper_limit = np.deg2rad(np.array([170, 120, 170, 120, 170, 120, 175])),
@@ -513,6 +779,26 @@ class Iiwa7System(Diagram):
                 controller.GetInputPort("desired_position"),
             )
 
+        elif operating_mode == IiwaOperatingMode.CARTESIAN_POS:
+            controller = builder.AddSystem(
+                CartesianPoseController(
+                    time_step=time_step,
+                    max_linear_velocity=max_linear_velocity,
+                    max_angular_velocity=max_angular_velocity,
+                )
+            )
+            command_source = builder.AddSystem(
+                RosCartesianPoseSource(ros_interface)
+            )
+            builder.Connect(
+                integrated_velocity.GetOutputPort("position"),
+                controller.GetInputPort("position"),
+            )
+            builder.Connect(
+                command_source.get_output_port(),
+                controller.GetInputPort("desired_pose"),
+            )
+
         else:
             raise ValueError(f'Invalid operating mode {operating_mode}')
 
@@ -530,6 +816,8 @@ class Iiwa7SystemsConfig:
     enable_left_arm: bool
     enable_right_arm: bool
     max_joint_velocity: float | list[float] = 1.0
+    max_linear_velocity: float | list[float] = 0.5
+    max_angular_velocity: float | list[float] = 1.8
     time_step: float = 0.005
 
 
@@ -564,6 +852,8 @@ def AddIiwa7Systems(
                 ros_interface=ros_interface,
                 operating_mode=config.operating_mode,
                 max_joint_velocity=config.max_joint_velocity,
+                max_linear_velocity=config.max_linear_velocity,
+                max_angular_velocity=config.max_angular_velocity,
                 time_step=config.time_step,
                 lcm_channel_suffix=lcm_channel_suffixs[k],
             )

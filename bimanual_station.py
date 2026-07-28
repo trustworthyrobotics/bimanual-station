@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument(
         "--operating_mode",
         choices=[m.value for m in IiwaOperatingMode],
-        default=IiwaOperatingMode.JOINT_POS.value,
+        default=IiwaOperatingMode.CARTESIAN_POS.value,
         help="IIWA robot operating mode.",
     )
 
@@ -53,7 +53,25 @@ def parse_args():
         nargs="+",
         default=[1.0],
         metavar="VEL",
-        help="IIWA robot maximum joint velocity. Specify one value or seven values.",
+        help="IIWA robot maximum joint velocity (rad/s). Specify one value or seven values.",
+    )
+
+    parser.add_argument(
+        "--max_linear_vel",
+        type=float,
+        nargs="+",
+        default=[0.5],
+        metavar="VEL",
+        help="IIWA robot maximum certesian linear velocity (m/s). Specify one value or three values.",
+    )
+
+    parser.add_argument(
+        "--max_angular_vel",
+        type=float,
+        nargs="+",
+        default=[1.8],
+        metavar="VEL",
+        help="IIWA robot maximum certesian angular velocity (rad/s). Specify one value or three values.",
     )
 
     args = parser.parse_args()
@@ -63,7 +81,17 @@ def parse_args():
     if len(args.max_joint_vel) == 1:
         args.max_joint_vel = args.max_joint_vel[0]
     elif len(args.max_joint_vel) != 7:
-        parser.error("--max_joint_vel must be specified as either a single value or 7 values.")
+        parser.error("--max_joint_vel must be specified as one value or seven values.")
+
+    if len(args.max_linear_vel) == 1:
+        args.max_linear_vel = args.max_linear_vel[0]
+    elif len(args.max_linear_vel) != 3:
+        parser.error("--max_linear_vel must be specified as one value or three values.")
+
+    if len(args.max_angular_vel) == 1:
+        args.max_angular_vel = args.max_angular_vel[0]
+    elif len(args.max_angular_vel) != 3:
+        parser.error("--max_angular_vel must be specified as one value or three values.")
 
     return args
 
@@ -82,6 +110,8 @@ def main():
         enable_left_arm=args.enable_left,
         enable_right_arm=args.enable_right,
         max_joint_velocity=args.max_joint_vel,
+        max_linear_velocity=args.max_linear_vel,
+        max_angular_velocity=args.max_angular_vel,
     )
 
     AddIiwa7Systems(
