@@ -163,6 +163,85 @@ class IiwaRobot(Diagram):
         builder.BuildInto(self)
 
 
+class IntegratedVelocityController(LeafSystem):
+    """
+    Integrates a commanded joint velocity into a commanded joint position.
+
+    q_cmd[k+1] = clip(
+        q_cmd[k] + dt * v_cmd[k],
+        joint_lower_limit,
+        joint_upper_limit,
+    )
+
+    The initial state is taken from the initial_joint_position input during
+    initialization.
+    """
+
+    def __init__(
+        self,
+        time_step: float,
+        num_joints: int = 7,
+        joint_lower_limit: float | list[float] = -np.inf,
+        joint_upper_limit: float | list[float] = np.inf,
+    ):
+        super().__init__()
+
+        self._num_joints = num_joints
+        self._time_step = time_step
+
+        lower = np.asarray(joint_lower_limit, dtype=float)
+        upper = np.asarray(joint_upper_limit, dtype=float)
+
+        if lower.ndim == 0:
+            lower = np.full(num_joints, lower)
+
+        if upper.ndim == 0:
+            upper = np.full(num_joints, upper)
+
+        assert lower.shape == (num_joints,)
+        assert upper.shape == (num_joints,)
+
+        self._lower = lower
+        self._upper = upper
+
+        self.velocity_input_port = self.DeclareVectorInputPort(
+            "velocity", num_joints
+        )
+
+        self.initial_position_input_port = self.DeclareVectorInputPort(
+            "initial_position", num_joints
+        )
+
+        state_index = self.DeclareDiscreteState(num_joints)
+
+        self.DeclareStateOutputPort("position", state_index)
+
+        self.DeclareInitializationDiscreteUpdateEvent(
+            self._InitializeState
+        )
+
+        self.DeclarePeriodicDiscreteUpdateEvent(
+            period_sec=time_step,
+            offset_sec=0.0,
+            update=self._DiscreteUpdate,
+        )
+
+    def _InitializeState(self, context, discrete_state):
+        q0 = self.initial_position_input_port.Eval(context)
+        q0 = np.clip(q0, self._lower, self._upper)
+        discrete_state.set_value(q0)
+        print(f"[INFO] Initial joint position {q0}")
+
+    def _DiscreteUpdate(self, context, discrete_state):
+        q = context.get_discrete_state_vector().value()
+        v = self.velocity_input_port.Eval(context)
+
+        q_next = q + self._time_step * v
+        q_next = np.clip(q_next, self._lower, self._upper)
+
+        discrete_state.set_value(q_next)
+
+
 class JointVelocityController(Diagram):
     """
     Clips desired joint velocities to joint velocity limits.
@@ -245,84 +324,6 @@ class JointPositionController(LeafSystem):
             self._max_velocity,
         )
         output.SetFromVector(velocity)
-
-
-class IntegratedVelocityController(LeafSystem):
-    """
-    Integrates a commanded joint velocity into a commanded joint position.
-
-    q_cmd[k+1] = clip(
-        q_cmd[k] + dt * v_cmd[k],
-        joint_lower_limit,
-        joint_upper_limit,
-    )
-
-    The initial state is taken from the initial_joint_position input during
-    initialization.
-    """
-
-    def __init__(
-        self,
-        time_step: float,
-        num_joints: int = 7,
-        joint_lower_limit: float | list[float] = -np.inf,
-        joint_upper_limit: float | list[float] = np.inf,
-    ):
-        super().__init__()
-
-        self._num_joints = num_joints
-        self._time_step = time_step
-
-        lower = np.asarray(joint_lower_limit, dtype=float)
-        upper = np.asarray(joint_upper_limit, dtype=float)
-
-        if lower.ndim == 0:
-            lower = np.full(num_joints, lower)
-
-        if upper.ndim == 0:
-            upper = np.full(num_joints, upper)
-
-        assert lower.shape == (num_joints,)
-        assert upper.shape == (num_joints,)
-
-        self._lower = lower
-        self._upper = upper
-
-        self.velocity_input_port = self.DeclareVectorInputPort(
-            "velocity", num_joints
-        )
-
-        self.initial_position_input_port = self.DeclareVectorInputPort(
-            "initial_position", num_joints
-        )
-
-        state_index = self.DeclareDiscreteState(num_joints)
-
-        self.DeclareStateOutputPort("position", state_index)
-
-        self.DeclareInitializationDiscreteUpdateEvent(
-            self._InitializeState
-        )
-
-        self.DeclarePeriodicDiscreteUpdateEvent(
-            period_sec=time_step,
-            offset_sec=0.0,
-            update=self._DiscreteUpdate,
-        )
-
-    def _InitializeState(self, context, discrete_state):
-        q0 = self.initial_position_input_port.Eval(context)
-        q0 = np.clip(q0, self._lower, self._upper)
-        discrete_state.set_value(q0)
-
-    def _DiscreteUpdate(self, context, discrete_state):
-        q = context.get_discrete_state_vector().value()
-        v = self.velocity_input_port.Eval(context)
-
-        q_next = q + self._time_step * v
-        q_next = np.clip(q_next, self._lower, self._upper)
-
-        discrete_state.set_value(q_next)
 
 
 class IiwaOperatingMode(Enum):
@@ -526,6 +527,8 @@ class Iiwa7System(Diagram):
 @dataclass
 class Iiwa7SystemsConfig:
     operating_mode: IiwaOperatingMode
+    enable_left_arm: bool
+    enable_right_arm: bool
     max_joint_velocity: float | list[float] = 1.0
     time_step: float = 0.005
 
@@ -536,24 +539,32 @@ def AddIiwa7Systems(
     config: Iiwa7SystemsConfig,
 ) -> None:
 
-    ros_namespace = "left_arm"
-    lcm_channel_suffix = ""
+    ros_namespaces = ["left_arm", "right_arm"]
+    lcm_channel_suffixs = ["", "_2"]
+    enabled = [config.enable_left_arm, config.enable_right_arm]
 
-    ros_interface = IiwaRosInterface(
-        namespace=ros_namespace,
-        operating_mode=config.operating_mode,
-    )
-    rclpy_executor.add_node(ros_interface)
+    if not any(enabled):
+        return
 
     lcm = AddLcm(diagram_builder)
 
-    diagram_builder.AddSystem(
-        Iiwa7System(
-            lcm=lcm,
-            ros_interface=ros_interface,
+    for k in range(2):
+        if not enabled[k]:
+            continue
+
+        ros_interface = IiwaRosInterface(
+            namespace=ros_namespaces[k],
             operating_mode=config.operating_mode,
-            max_joint_velocity=config.max_joint_velocity,
-            time_step=config.time_step,
-            lcm_channel_suffix=lcm_channel_suffix,
         )
-    )
+        rclpy_executor.add_node(ros_interface)
+
+        diagram_builder.AddSystem(
+            Iiwa7System(
+                lcm=lcm,
+                ros_interface=ros_interface,
+                operating_mode=config.operating_mode,
+                max_joint_velocity=config.max_joint_velocity,
+                time_step=config.time_step,
+                lcm_channel_suffix=lcm_channel_suffixs[k],
+            )
+        )
