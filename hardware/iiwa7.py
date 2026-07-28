@@ -48,7 +48,7 @@ from pydrake.all import (
 import rclpy
 from rclpy.node import Node
 
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TwistStamped
 from sensor_msgs.msg import JointState
 
 
@@ -435,6 +435,67 @@ def Iiwa7DifferentialInverseKinematics(
     return diff_ik_system, ee_frame
 
 
+class CartesianVelocityController(Diagram):
+    """
+    The CartesianVelocityController converts desired end-effector velocity into joint
+    velocity commands using Differential Inverse Kinematics.
+    """
+
+    def __init__(
+        self,
+        time_step: float,
+        max_linear_velocity: float | list[float],
+        max_angular_velocity: float | list[float],
+    ):
+        super().__init__()
+
+        builder = DiagramBuilder()
+
+        diff_ik, ee_frame = Iiwa7DifferentialInverseKinematics(
+            time_step=time_step,
+            max_linear_velocity=max_linear_velocity,
+            max_angular_velocity=max_angular_velocity,
+        )
+
+        diff_ik = builder.AddSystem(diff_ik)
+
+        vel_bus = BusCreator()
+        vel_bus.DeclareAbstractInputPort(
+            ee_frame,
+            AbstractValue.Make(SpatialVelocity())
+        )
+        vel_bus = builder.AddSystem(vel_bus)
+
+        zero_position = builder.AddSystem(ConstantVectorSource(np.zeros(7)))
+
+        builder.Connect(
+            vel_bus.get_output_port(),
+            diff_ik.GetInputPort("desired_cartesian_velocities"),
+        )
+
+        builder.Connect(
+            zero_position.get_output_port(),
+            diff_ik.GetInputPort("nominal_posture"),
+        )
+
+        builder.ExportInput(
+            diff_ik.GetInputPort("position"),
+            "position",
+        )
+
+        builder.ExportInput(
+            vel_bus.GetInputPort(ee_frame),
+            "desired_cartesian_velocity",
+        )
+
+        builder.ExportOutput(
+            diff_ik.GetOutputPort("commanded_velocity"),
+            "commanded_velocity",
+        )
+
+        builder.BuildInto(self)
+
+
 class CartesianPoseController(Diagram):
     """
     The CartesianPoseController converts desired end-effector poses into joint
@@ -487,9 +548,8 @@ class CartesianPoseController(Diagram):
 
         builder.ExportInput(
             pose_bus.GetInputPort(ee_frame),
-            "desired_pose",
+            "desired_cartesian_pose",
         )
-
 
         class PoseSelector(LeafSystem):
             def __init__(self):
@@ -556,6 +616,7 @@ class CartesianPoseController(Diagram):
 class IiwaOperatingMode(Enum):
     JOINT_VEL = "joint_vel"
     JOINT_POS = "joint_pos"
+    CARTESIAN_VEL = "cartesian_vel"
     CARTESIAN_POS = "cartesian_pos"
 
 
@@ -580,6 +641,13 @@ class IiwaRosInterface(Node):
                 JointState,
                 f"/{namespace}/cmd_joint_pos",
                 self._CmdJointPosCallback,
+                1,
+            )
+        elif operating_mode == IiwaOperatingMode.CARTESIAN_VEL:
+            self.create_subscription(
+                TwistStamped,
+                f"/{namespace}/cmd_cartesian_vel",
+                self._CmdCartesianVelCallback,
                 1,
             )
         elif operating_mode == IiwaOperatingMode.CARTESIAN_POS:
@@ -617,6 +685,19 @@ class IiwaRosInterface(Node):
             self._command_value = np.array(msg.position)
             self._new_command = True
             self.get_logger().info(f"Received joint position command {self._command_value}")
+
+    def _CmdCartesianVelCallback(self, msg: TwistStamped):
+        t = msg.twist
+
+        linear = np.array([t.linear.x, t.linear.y, t.linear.z])
+        angular = np.array([t.angular.x, t.angular.y, t.angular.z])
+
+        V_WT =  SpatialVelocity(angular, linear)
+
+        with self._lock:
+            self._command_value = V_WT
+            self._new_command = True
+            self.get_logger().info(f"Received cartesian velocity command {self._command_value}")
 
     def _CmdCartesianPosCallback(self, msg: PoseStamped):
         p = msg.pose
@@ -688,6 +769,25 @@ class RosJointVelocitySource(LeafSystem):
         output.SetFromVector(qvel)
 
 
+class RosCartesianVelocitySource(LeafSystem):
+    def __init__(self, ros_interface):
+        super().__init__()
+
+        self._ros_interface = ros_interface
+
+        self.DeclareAbstractOutputPort(
+            "desired_cartesian_velocity",
+            lambda: AbstractValue.Make(SpatialVelocity()),
+            self._CalcOutput,
+        )
+
+    def _CalcOutput(self, context, output):
+        cart_vel, new = self._ros_interface.ConsumeCommand()
+        if cart_vel is None:
+            cart_vel = SpatialVelocity(np.zeros(6))
+        output.set_value(cart_vel)
+
+
 class RosCartesianPoseSource(LeafSystem):
     def __init__(self, ros_interface):
         super().__init__()
@@ -695,7 +795,7 @@ class RosCartesianPoseSource(LeafSystem):
         self._ros_interface = ros_interface
 
         self.DeclareAbstractOutputPort(
-            "desired_pose",
+            "desired_cartesian_pose",
             lambda: AbstractValue.Make(RigidTransform()),
             self._CalcOutput,
         )
@@ -779,6 +879,26 @@ class Iiwa7System(Diagram):
                 controller.GetInputPort("desired_position"),
             )
 
+        elif operating_mode == IiwaOperatingMode.CARTESIAN_VEL:
+            controller = builder.AddSystem(
+                CartesianVelocityController(
+                    time_step=time_step,
+                    max_linear_velocity=max_linear_velocity,
+                    max_angular_velocity=max_angular_velocity,
+                )
+            )
+            command_source = builder.AddSystem(
+                RosCartesianVelocitySource(ros_interface)
+            )
+            builder.Connect(
+                integrated_velocity.GetOutputPort("position"),
+                controller.GetInputPort("position"),
+            )
+            builder.Connect(
+                command_source.get_output_port(),
+                controller.GetInputPort("desired_cartesian_velocity"),
+            )
+
         elif operating_mode == IiwaOperatingMode.CARTESIAN_POS:
             controller = builder.AddSystem(
                 CartesianPoseController(
@@ -796,7 +916,7 @@ class Iiwa7System(Diagram):
             )
             builder.Connect(
                 command_source.get_output_port(),
-                controller.GetInputPort("desired_pose"),
+                controller.GetInputPort("desired_cartesian_pose"),
             )
 
         else:
@@ -849,12 +969,12 @@ def AddIiwa7Systems(
         diagram_builder.AddSystem(
             Iiwa7System(
                 lcm=lcm,
+                lcm_channel_suffix=lcm_channel_suffixs[k],
                 ros_interface=ros_interface,
                 operating_mode=config.operating_mode,
                 max_joint_velocity=config.max_joint_velocity,
                 max_linear_velocity=config.max_linear_velocity,
                 max_angular_velocity=config.max_angular_velocity,
                 time_step=config.time_step,
-                lcm_channel_suffix=lcm_channel_suffixs[k],
             )
         )
