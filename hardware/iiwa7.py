@@ -1,4 +1,7 @@
+import threading
+
 import numpy as np
+
 from drake import (
     lcmt_iiwa_command,
     lcmt_iiwa_status,
@@ -8,7 +11,6 @@ from pydrake.all import (
     OutputPort,
     Diagram,
     DiagramBuilder,
-    DiscreteTimeIntegrator,
     IiwaCommandSender,
     IiwaControlMode,
     IiwaStatusReceiver,
@@ -22,6 +24,11 @@ from pydrake.all import (
     LcmInterfaceSystem,
     LeafSystem,
 )
+
+import rclpy
+from rclpy.node import Node
+
+from sensor_msgs.msg import JointState
 
 
 def AddLcm(builder: DiagramBuilder):
@@ -284,35 +291,118 @@ class IntegratedVelocityController(LeafSystem):
         discrete_state.set_value(q_next)
 
 
+class IiwaRosInterface(Node):
+    def __init__(self, namespace):
+        super().__init__(namespace)
+
+        self._lock = threading.Lock()
+
+        self._desired_position = np.full(7, np.nan)
+        self._new_command = False
+
+        self.create_subscription(
+            JointState,
+            f"/{namespace}/cmd_joint_pos",
+            self._command_callback,
+            1,
+        )
+
+        self._joint_state_pub = self.create_publisher(
+            JointState,
+            f"/{namespace}/joint_states",
+            10,
+        )
+
+    def _command_callback(self, msg: JointState):
+        if len(msg.position) != 7:
+            self.get_logger().warn("Expected 7 joint positions.")
+            return
+
+        with self._lock:
+            self._desired_position = np.array(msg.position)
+            self._new_command = True
+
+    def consume_command(self):
+        with self._lock:
+            q = self._desired_position.copy()
+            new = self._new_command
+            self._new_command = False
+
+        return q, new
+
+    def publish_joint_state(
+        self,
+        position,
+        velocity,
+        effort,
+    ):
+        msg = JointState()
+
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = [f"joint_{i}" for i in range(1, 8)]
+
+        msg.position = list(position)
+        msg.velocity = list(velocity)
+        msg.effort = list(effort)
+
+        self._joint_state_pub.publish(msg)
+
+
+class RosCommandSource(LeafSystem):
+    def __init__(self, ros_interface):
+        super().__init__()
+
+        self._ros = ros_interface
+        self._command = np.zeros(7)
+
+        self.DeclareVectorOutputPort(
+            "desired_position",
+            7,
+            self._calc_output,
+        )
+
+    def _calc_output(self, context, output):
+        q, new = self._ros.consume_command()
+
+        self._command = q
+
+        output.SetFromVector(q)
+
+
 class Iiwa7System(Diagram):
     def __init__(
         self,
-        max_velocity=1.0,
-        time_step: float = 0.005,
+        lcm: DrakeLcmInterface,
+        ros_interface: IiwaRosInterface,
+        time_step: float,
+        max_joint_velocity = 1.0,
+        lcm_channel_suffix: str = "",
+        joint_upper_limit = np.deg2rad(np.array([170, 120, 170, 120, 170, 120, 175])),
+        joint_lower_limit = np.deg2rad(-np.array([170, 120, 170, 120, 170, 120, 175])),
     ):
         super().__init__()
 
         builder = DiagramBuilder()
 
-        lcm = AddLcm(builder)
-
         robot = builder.AddSystem(
             IiwaRobot(
                 lcm=lcm,
+                lcm_channel_suffix=lcm_channel_suffix,
                 control_mode=IiwaControlMode.kPositionAndTorque,
-                lcm_channel_suffix="",
             )
         )
 
         controller = builder.AddSystem(
             JointPositionController(
                 time_step=time_step,
-                max_velocity=max_velocity,
+                max_velocity=max_joint_velocity,
             )
         )
 
-        joint_upper_limit = np.deg2rad(np.array([170, 120, 170, 120, 170, 120, 175]))
-        joint_lower_limit = -joint_upper_limit
+        command_source = builder.AddSystem(
+            RosCommandSource(ros_interface)
+        )
+
 
         integrated_velocity = builder.AddSystem(
             IntegratedVelocityController(
@@ -341,9 +431,33 @@ class Iiwa7System(Diagram):
             controller.GetInputPort("position"),
         )
 
-        builder.ExportInput(
+        builder.Connect(
+            command_source.get_output_port(),
             controller.GetInputPort("desired_position"),
-            "desired_position",
         )
 
         builder.BuildInto(self)
+
+
+def AddIiwa7Systems(
+    diagram_builder: DiagramBuilder,
+    rclpy_executor: rclpy.executors.Executor,
+    ros_namespace: str = "left_arm",
+    lcm_channel_suffix: str = "",
+    time_step: float = 0.005,
+) -> None:
+
+    ros_interface = IiwaRosInterface(namespace=ros_namespace)
+
+    rclpy_executor.add_node(ros_interface)
+
+    lcm = AddLcm(diagram_builder)
+
+    diagram_builder.AddSystem(
+        Iiwa7System(
+            lcm=lcm,
+            ros_interface=ros_interface,
+            time_step=time_step,
+            lcm_channel_suffix=lcm_channel_suffix,
+        )
+    )
