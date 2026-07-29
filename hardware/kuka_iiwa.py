@@ -44,6 +44,9 @@ from pydrake.all import (
     InputPortIndex,
     PortSwitch,
     FixedOffsetFrame,
+    MultibodyPlant,
+    ModelInstanceIndex,
+    Frame,
 )
 
 import rclpy
@@ -338,12 +341,94 @@ class JointPositionController(LeafSystem):
         output.SetFromVector(velocity)
 
 
+def AddIiwa7Model(
+        plant: MultibodyPlant,
+        end_effector_z_offset: float
+    ) -> tuple[ModelInstanceIndex, Frame]:
+
+    iiwa_instance = Parser(plant).AddModelsFromUrl(
+        f"package://drake_models/iiwa_description/sdf/iiwa7_no_collision.sdf"
+    )[0]
+
+    plant.WeldFrames(
+        plant.world_frame(),
+        plant.GetFrameByName("iiwa_link_0", iiwa_instance),
+        RigidTransform(),
+    )
+
+    ee_frame = plant.AddFrame(
+        FixedOffsetFrame(
+            name="iiwa_ee",
+            P=plant.GetFrameByName("iiwa_link_7", iiwa_instance),
+            X_PF=RigidTransform([0.0, 0.0, end_effector_z_offset]),
+        )
+    )
+
+    return iiwa_instance, ee_frame
+
+
+class IiwaForwardKinematics(LeafSystem):
+    """
+    Converts joint positions into the end-effector pose via forward kinematics.
+    """
+
+    def __init__(self, end_effector_z_offset: float):
+        super().__init__()
+
+        plant = MultibodyPlant(0.0)
+        iiwa_instance, ee_frame  = AddIiwa7Model(plant, end_effector_z_offset)
+        plant.Finalize()
+
+        self._plant = plant
+        self._ee_frame = ee_frame
+        self._plant_context = plant.CreateDefaultContext()
+
+        self._position_input_port = self.DeclareVectorInputPort(
+            "position", plant.num_positions()
+        )
+
+        self._velocity_input_port = self.DeclareVectorInputPort(
+            "velocity", plant.num_velocities()
+        )
+
+        self.DeclareAbstractOutputPort(
+            "cartesian_pose",
+            lambda: AbstractValue.Make(RigidTransform()),
+            self._CalcCartesianPose,
+        )
+
+        self.DeclareAbstractOutputPort(
+            "cartesian_velocity",
+            lambda: AbstractValue.Make(SpatialVelocity()),
+            self._CalcCartesianVelocity,
+        )
+
+    def _CalcCartesianPose(self, context, output):
+        position = self._position_input_port.Eval(context)
+
+        self._plant.SetPositions(self._plant_context, position)
+
+        X_WT = self._ee_frame.CalcPoseInWorld(self._plant_context)
+
+        output.set_value(X_WT)
+
+    def _CalcCartesianVelocity(self, context, output):
+        position = self._position_input_port.Eval(context)
+        velocity = self._velocity_input_port.Eval(context)
+
+        self._plant.SetPositions(self._plant_context, position)
+        self._plant.SetVelocities(self._plant_context, velocity)
+
+        V_WT = self._ee_frame.CalcSpatialVelocityInWorld(self._plant_context)
+
+        output.set_value(V_WT)
+
+
 def IiwaDifferentialInverseKinematics(
         end_effector_z_offset: float,
         time_step: float,
         max_linear_velocity: float | list[float],
         max_angular_velocity: float | list[float],
-        iiwa_name: str = "iiwa7"
     ) -> tuple[DifferentialInverseKinematicsSystem, str]:
 
     if np.isscalar(max_linear_velocity):
@@ -354,28 +439,12 @@ def IiwaDifferentialInverseKinematics(
 
     robot_builder = RobotDiagramBuilder()
 
-    plant = robot_builder.plant()
-
-    iiwa_instance = Parser(plant).AddModelsFromUrl(
-        f"package://drake_models/iiwa_description/sdf/{iiwa_name}_no_collision.sdf"
-    )[0]
-
-    plant.WeldFrames(
-        plant.world_frame(),
-        plant.GetFrameByName("iiwa_link_0", iiwa_instance),
-        RigidTransform(),
-    )
-
-    plant.AddFrame(
-        FixedOffsetFrame(
-            name="iiwa_ee",
-            P=plant.GetFrameByName("iiwa_link_7", iiwa_instance),
-            X_PF=RigidTransform([0.0, 0.0, end_effector_z_offset]),
-        )
+    iiwa_instance, ee_frame = AddIiwa7Model(
+        plant=robot_builder.plant(),
+        end_effector_z_offset=end_effector_z_offset,
     )
 
     robot_diagram = robot_builder.Build()
-
     plant = robot_diagram.plant()
 
     collision_checker = SceneGraphCollisionChecker(
@@ -386,9 +455,7 @@ def IiwaDifferentialInverseKinematics(
         )
     )
 
-    ee_frame = plant.GetFrameByName("iiwa_ee").scoped_name().get_full()
-    task_frame = plant.world_frame().scoped_name().get_full()
-
+    ee_frame = ee_frame.scoped_name().get_full()
     cartesian_axis_masks = { ee_frame: np.ones(6) }
 
     assert plant.num_positions() == 7
@@ -427,7 +494,7 @@ def IiwaDifferentialInverseKinematics(
 
     diff_ik_system = DifferentialInverseKinematicsSystem(
         recipe=recipe,
-        task_frame=task_frame,
+        task_frame=plant.world_frame().scoped_name().get_full(),
         collision_checker=collision_checker,
         active_dof=active_dof,
         time_step=time_step,
@@ -662,34 +729,44 @@ class IiwaRosInterface(Node):
             1,
         )
 
-        self._position_commanded_pub = self.create_publisher(
+        self._joint_position_commanded_pub = self.create_publisher(
             JointState,
             f"/{namespace}/joint_position_commanded",
             10,
         )
-        self._position_measured_pub = self.create_publisher(
+        self._joint_position_measured_pub = self.create_publisher(
             JointState,
             f"/{namespace}/joint_position_measured",
             10,
         )
-        self._velocity_estimated_pub = self.create_publisher(
+        self._joint_velocity_estimated_pub = self.create_publisher(
             JointState,
             f"/{namespace}/joint_velocity_estimated",
             10,
         )
-        self._torque_commanded_pub = self.create_publisher(
+        self._joint_torque_commanded_pub = self.create_publisher(
             JointState,
             f"/{namespace}/joint_torque_commanded",
             10,
         )
-        self._torque_measured_pub = self.create_publisher(
+        self._joint_torque_measured_pub = self.create_publisher(
             JointState,
             f"/{namespace}/joint_torque_measured",
             10,
         )
-        self._torque_external_pub = self.create_publisher(
+        self._joint_torque_external_pub = self.create_publisher(
             JointState,
             f"/{namespace}/joint_torque_external",
+            10,
+        )
+        self._cartesian_pose_measured_pub = self.create_publisher(
+            PoseStamped,
+            f"/{namespace}/cartesian_pose_measured",
+            10,
+        )
+        self._cartesian_velocity_estimated_pub = self.create_publisher(
+            TwistStamped,
+            f"/{namespace}/cartesian_velocity_estimated",
             10,
         )
 
@@ -754,12 +831,14 @@ class IiwaRosInterface(Node):
 
     def PublishReport(
         self,
-        position_commanded,
-        position_measured,
-        velocity_estimated,
-        torque_commanded,
-        torque_measured,
-        torque_external,
+        joint_position_commanded: np.ndarray,
+        joint_position_measured: np.ndarray,
+        joint_velocity_estimated: np.ndarray,
+        joint_torque_commanded: np.ndarray,
+        joint_torque_measured: np.ndarray,
+        joint_torque_external: np.ndarray,
+        cartesian_pose_measured: RigidTransform,
+        cartesian_velocity_estimated: SpatialVelocity,
     ):
         stamp = self.get_clock().now().to_msg()
         names = [f"joint_{i}" for i in range(1, 8)]
@@ -776,12 +855,50 @@ class IiwaRosInterface(Node):
                 msg.effort = list(effort)
             return msg
 
-        self._position_commanded_pub.publish(MakeMsg(position=position_commanded))
-        self._position_measured_pub.publish(MakeMsg(position=position_measured))
-        self._velocity_estimated_pub.publish(MakeMsg(velocity=velocity_estimated))
-        self._torque_commanded_pub.publish(MakeMsg(effort=torque_commanded))
-        self._torque_measured_pub.publish(MakeMsg(effort=torque_measured))
-        self._torque_external_pub.publish(MakeMsg(effort=torque_external))
+        self._joint_position_commanded_pub.publish(MakeMsg(position=joint_position_commanded))
+        self._joint_position_measured_pub.publish(MakeMsg(position=joint_position_measured))
+        self._joint_velocity_estimated_pub.publish(MakeMsg(velocity=joint_velocity_estimated))
+        self._joint_torque_commanded_pub.publish(MakeMsg(effort=joint_torque_commanded))
+        self._joint_torque_measured_pub.publish(MakeMsg(effort=joint_torque_measured))
+        self._joint_torque_external_pub.publish(MakeMsg(effort=joint_torque_external))
+
+        def MakePoseMsg(X_WT: RigidTransform) -> PoseStamped:
+            msg = PoseStamped()
+            msg.header.stamp = stamp
+
+            translation = X_WT.translation()
+            quaternion = X_WT.rotation().ToQuaternion()
+
+            msg.pose.position.x = translation[0]
+            msg.pose.position.y = translation[1]
+            msg.pose.position.z = translation[2]
+
+            msg.pose.orientation.w = quaternion.w()
+            msg.pose.orientation.x = quaternion.x()
+            msg.pose.orientation.y = quaternion.y()
+            msg.pose.orientation.z = quaternion.z()
+
+            return msg
+
+        def MakeTwistMsg(V_WT: SpatialVelocity) -> TwistStamped:
+            msg = TwistStamped()
+            msg.header.stamp = stamp
+
+            angular = V_WT.rotational()
+            linear = V_WT.translational()
+
+            msg.twist.linear.x = linear[0]
+            msg.twist.linear.y = linear[1]
+            msg.twist.linear.z = linear[2]
+
+            msg.twist.angular.x = angular[0]
+            msg.twist.angular.y = angular[1]
+            msg.twist.angular.z = angular[2]
+
+            return msg
+
+        self._cartesian_pose_measured_pub.publish(MakePoseMsg(cartesian_pose_measured))
+        self._cartesian_velocity_estimated_pub.publish(MakeTwistMsg(cartesian_velocity_estimated))
 
 
 class RosCommandSource(LeafSystem):
@@ -935,6 +1052,12 @@ class RosReportSink(LeafSystem):
         self.torque_external_input_port = self.DeclareVectorInputPort(
             "torque_external", num_joints
         )
+        self.cartesian_pose_measured_input_port = self.DeclareAbstractInputPort(
+            "cartesian_pose_measured", AbstractValue.Make(RigidTransform())
+        )
+        self.cartesian_velocity_estimated_input_port = self.DeclareAbstractInputPort(
+            "cartesian_velocity_estimated", AbstractValue.Make(SpatialVelocity())
+        )
 
         self.DeclarePeriodicPublishEvent(
             period_sec=publish_period,
@@ -944,12 +1067,14 @@ class RosReportSink(LeafSystem):
 
     def _Publish(self, context):
         self._ros_interface.PublishReport(
-            position_commanded=self.position_commanded_input_port.Eval(context),
-            position_measured=self.position_measured_input_port.Eval(context),
-            velocity_estimated=self.velocity_estimated_input_port.Eval(context),
-            torque_commanded=self.torque_commanded_input_port.Eval(context),
-            torque_measured=self.torque_measured_input_port.Eval(context),
-            torque_external=self.torque_external_input_port.Eval(context),
+            joint_position_commanded=self.position_commanded_input_port.Eval(context),
+            joint_position_measured=self.position_measured_input_port.Eval(context),
+            joint_velocity_estimated=self.velocity_estimated_input_port.Eval(context),
+            joint_torque_commanded=self.torque_commanded_input_port.Eval(context),
+            joint_torque_measured=self.torque_measured_input_port.Eval(context),
+            joint_torque_external=self.torque_external_input_port.Eval(context),
+            cartesian_pose_measured=self.cartesian_pose_measured_input_port.Eval(context),
+            cartesian_velocity_estimated=self.cartesian_velocity_estimated_input_port.Eval(context),
         )
 
 
@@ -1080,6 +1205,7 @@ class IiwaSystem(Diagram):
             integrated_velocity.get_input_port(4),
         )
 
+        # Report joint state
         report_sink = builder.AddSystem(
             RosReportSink(
                 ros_interface=ros_interface,
@@ -1098,6 +1224,27 @@ class IiwaSystem(Diagram):
                 robot.GetOutputPort(port_name),
                 report_sink.GetInputPort(port_name),
             )
+
+        # Report cartesian state
+        forward_kinamatics = builder.AddSystem(
+            IiwaForwardKinematics(end_effector_z_offset=end_effector_z_offset)
+        )
+        builder.Connect(
+            robot.GetOutputPort("position_measured"),
+            forward_kinamatics.GetInputPort("position"),
+        )
+        builder.Connect(
+            robot.GetOutputPort("velocity_estimated"),
+            forward_kinamatics.GetInputPort("velocity"),
+        )
+        builder.Connect(
+            forward_kinamatics.GetOutputPort("cartesian_pose"),
+            report_sink.GetInputPort("cartesian_pose_measured"),
+        )
+        builder.Connect(
+            forward_kinamatics.GetOutputPort("cartesian_velocity"),
+            report_sink.GetInputPort("cartesian_velocity_estimated"),
+        )
 
         builder.BuildInto(self)
 
