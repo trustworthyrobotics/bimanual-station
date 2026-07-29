@@ -160,20 +160,6 @@ class IiwaRobot(Diagram):
             "torque_external",
         )
 
-        mux = builder.AddSystem(Multiplexer(input_sizes=[7, 7]))
-        builder.Connect(
-            iiwa_status_receiver.get_position_measured_output_port(),
-            mux.get_input_port(0),
-        )
-        builder.Connect(
-            iiwa_status_receiver.get_velocity_estimated_output_port(),
-            mux.get_input_port(1),
-        )
-        builder.ExportOutput(
-            mux.get_output_port(),
-            "state_estimated",
-        )
-
         builder.BuildInto(self)
 
 
@@ -676,9 +662,34 @@ class IiwaRosInterface(Node):
             1,
         )
 
-        self._joint_state_pub = self.create_publisher(
+        self._position_commanded_pub = self.create_publisher(
             JointState,
-            f"/{namespace}/joint_states",
+            f"/{namespace}/joint_position_commanded",
+            10,
+        )
+        self._position_measured_pub = self.create_publisher(
+            JointState,
+            f"/{namespace}/joint_position_measured",
+            10,
+        )
+        self._velocity_estimated_pub = self.create_publisher(
+            JointState,
+            f"/{namespace}/joint_velocity_estimated",
+            10,
+        )
+        self._torque_commanded_pub = self.create_publisher(
+            JointState,
+            f"/{namespace}/joint_torque_commanded",
+            10,
+        )
+        self._torque_measured_pub = self.create_publisher(
+            JointState,
+            f"/{namespace}/joint_torque_measured",
+            10,
+        )
+        self._torque_external_pub = self.create_publisher(
+            JointState,
+            f"/{namespace}/joint_torque_external",
             10,
         )
 
@@ -741,25 +752,53 @@ class IiwaRosInterface(Node):
 
         return command_mode, command_value, new_command
 
-    def publish_joint_state(
+    def PublishReport(
         self,
-        position,
-        velocity,
-        effort,
+        position_commanded,
+        position_measured,
+        velocity_estimated,
+        torque_commanded,
+        torque_measured,
+        torque_external,
     ):
-        msg = JointState()
+        stamp = self.get_clock().now().to_msg()
+        names = [f"joint_{i}" for i in range(1, 8)]
 
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = [f"joint_{i}" for i in range(1, 8)]
+        def MakeMsg(position=None, velocity=None, effort=None):
+            msg = JointState()
+            msg.header.stamp = stamp
+            msg.name = names
+            if position is not None:
+                msg.position = list(position)
+            if velocity is not None:
+                msg.velocity = list(velocity)
+            if effort is not None:
+                msg.effort = list(effort)
+            return msg
 
-        msg.position = list(position)
-        msg.velocity = list(velocity)
-        msg.effort = list(effort)
-
-        self._joint_state_pub.publish(msg)
+        self._position_commanded_pub.publish(MakeMsg(position=position_commanded))
+        self._position_measured_pub.publish(MakeMsg(position=position_measured))
+        self._velocity_estimated_pub.publish(MakeMsg(velocity=velocity_estimated))
+        self._torque_commanded_pub.publish(MakeMsg(effort=torque_commanded))
+        self._torque_measured_pub.publish(MakeMsg(effort=torque_measured))
+        self._torque_external_pub.publish(MakeMsg(effort=torque_external))
 
 
 class RosCommandSource(LeafSystem):
+    """
+    Bridges ROS command messages received by an IiwaRosInterface into Drake
+    output ports.
+
+    Whenever a new command arrives on the IiwaRosInterface (joint velocity,
+    joint position, cartesian velocity, or cartesian pose), it is latched
+    into internal state and exposed on the corresponding output port. The
+    "active_port" output identifies which command mode is currently active.
+    Inactive joint output ports default to zero (velocity) or NaN
+    (position), and inactive cartesian output ports default to zero
+    (velocity) or NaN translation (pose), so downstream consumers can detect
+    an unset command.
+    """
+
     def __init__(self, ros_interface: IiwaRosInterface):
         super().__init__()
 
@@ -861,6 +900,57 @@ class RosCommandSource(LeafSystem):
             output.set_value(value)
         else:
             output.set_value(RigidTransform(np.full(3, np.nan)))
+
+
+class RosReportSink(LeafSystem):
+    """
+    Publishes IIWA status signals to ROS through the given IiwaRosInterface.
+    """
+
+    def __init__(
+        self,
+        ros_interface: IiwaRosInterface,
+        publish_period: float,
+        num_joints: int = 7,
+    ):
+        super().__init__()
+
+        self._ros_interface = ros_interface
+
+        self.position_commanded_input_port = self.DeclareVectorInputPort(
+            "position_commanded", num_joints
+        )
+        self.position_measured_input_port = self.DeclareVectorInputPort(
+            "position_measured", num_joints
+        )
+        self.velocity_estimated_input_port = self.DeclareVectorInputPort(
+            "velocity_estimated", num_joints
+        )
+        self.torque_commanded_input_port = self.DeclareVectorInputPort(
+            "torque_commanded", num_joints
+        )
+        self.torque_measured_input_port = self.DeclareVectorInputPort(
+            "torque_measured", num_joints
+        )
+        self.torque_external_input_port = self.DeclareVectorInputPort(
+            "torque_external", num_joints
+        )
+
+        self.DeclarePeriodicPublishEvent(
+            period_sec=publish_period,
+            offset_sec=0.0,
+            publish=self._Publish,
+        )
+
+    def _Publish(self, context):
+        self._ros_interface.PublishReport(
+            position_commanded=self.position_commanded_input_port.Eval(context),
+            position_measured=self.position_measured_input_port.Eval(context),
+            velocity_estimated=self.velocity_estimated_input_port.Eval(context),
+            torque_commanded=self.torque_commanded_input_port.Eval(context),
+            torque_measured=self.torque_measured_input_port.Eval(context),
+            torque_external=self.torque_external_input_port.Eval(context),
+        )
 
 
 class IiwaSystem(Diagram):
@@ -989,6 +1079,25 @@ class IiwaSystem(Diagram):
             cartesian_pos_controller.GetOutputPort("commanded_velocity"),
             integrated_velocity.get_input_port(4),
         )
+
+        report_sink = builder.AddSystem(
+            RosReportSink(
+                ros_interface=ros_interface,
+                publish_period=time_step,
+            )
+        )
+        for port_name in (
+            "position_commanded",
+            "position_measured",
+            "velocity_estimated",
+            "torque_commanded",
+            "torque_measured",
+            "torque_external",
+        ):
+            builder.Connect(
+                robot.GetOutputPort(port_name),
+                report_sink.GetInputPort(port_name),
+            )
 
         builder.BuildInto(self)
 
