@@ -9,7 +9,7 @@ from pydrake.all import (
     Simulator,
 )
 
-from hardware.iiwa7 import AddIiwa7Systems
+from hardware import AddIiwaSystems
 
 
 def parse_args():
@@ -44,6 +44,14 @@ def parse_args():
         help="IIWA robot maximum certesian angular velocity (rad/s). Specify one value or three values.",
     )
 
+    parser.add_argument(
+        "--tool_z_offset",
+        type=float,
+        default=0.0,
+        metavar="OFFSET",
+        help="Tool z offset from the flange face (m).",
+    )
+
     args = parser.parse_args()
 
     if len(args.max_joint_vel) == 1:
@@ -73,12 +81,13 @@ def main():
 
     diagram_builder = DiagramBuilder()
 
-    AddIiwa7Systems(
+    AddIiwaSystems(
         diagram_builder=diagram_builder,
         rclpy_executor=rclpy_executor,
         max_joint_velocity=args.max_joint_vel,
         max_linear_velocity=args.max_linear_vel,
         max_angular_velocity=args.max_angular_vel,
+        tool_z_offset=args.tool_z_offset,
     )
 
     ros_thread = threading.Thread(
