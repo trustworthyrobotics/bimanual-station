@@ -33,12 +33,6 @@ To connect to the **left IIWA**, run:
     --lcm_status_channel IIWA_STATUS
 ```
 
-These are the default arguments, so the same connection can be started with:
-
-```bash
-./iiwa_driver
-```
-
 To connect to the **right IIWA**, run:
 
 ```bash
@@ -60,6 +54,8 @@ The `bimanual_station.py` script provides ROS 2 interfaces for controlling the I
 | Cartesian velocity | `/<namespace>/cmd_cartesian_vel` |
 | Cartesian pose     | `/<namespace>/cmd_cartesian_pos` |
 
+where `<namespace>` is either `left_iiwa` or `right_iiwa`.
+
 The maximum joint velocity, cartesian linear velocity, cartesian angular velocity, and tool offset can be configured through command-line arguments:
 
 ```bash
@@ -70,4 +66,6 @@ bimanual_station.py \
     [--tool_z_offset OFFSET]
 ```
 
-Each velocity argument accepts either a single value or a list of values for per-joint/per-axis limits.
+### `xbox_jogger.py`
+
+The `xbox_jogger.py` script provides interactive Cartesian velocity control of one or two arms using an Xbox controller.
