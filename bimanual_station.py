@@ -9,7 +9,7 @@ from pydrake.all import (
     Simulator,
 )
 
-from hardware.iiwa7 import AddIiwa7Systems, Iiwa7SystemsConfig, IiwaOperatingMode
+from hardware.iiwa7 import AddIiwa7Systems, Iiwa7SystemsConfig
 
 
 def parse_args():
@@ -24,13 +24,6 @@ def parse_args():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-
-    parser.add_argument(
-        "--operating_mode",
-        choices=[m.value for m in IiwaOperatingMode],
-        default=IiwaOperatingMode.CARTESIAN_POS.value,
-        help="IIWA robot operating mode.",
     )
 
     parser.add_argument(
@@ -76,8 +69,6 @@ def parse_args():
 
     args = parser.parse_args()
 
-    args.operating_mode = IiwaOperatingMode(args.operating_mode)
-
     if len(args.max_joint_vel) == 1:
         args.max_joint_vel = args.max_joint_vel[0]
     elif len(args.max_joint_vel) != 7:
@@ -106,7 +97,6 @@ def main():
     diagram_builder = DiagramBuilder()
 
     config = Iiwa7SystemsConfig(
-        operating_mode=args.operating_mode,
         enable_left_arm=args.enable_left,
         enable_right_arm=args.enable_right,
         max_joint_velocity=args.max_joint_vel,

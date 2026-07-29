@@ -181,30 +181,26 @@ class IiwaRobot(Diagram):
         builder.BuildInto(self)
 
 
-class IntegratedVelocityController(LeafSystem):
+class IntegratedVelocitySwitch(LeafSystem):
     """
-    Integrates a commanded joint velocity into a commanded joint position.
+    Integrates one of several commanded joint velocities into a commanded joint
+    position.
 
-    q_cmd[k+1] = clip(
-        q_cmd[k] + dt * v_cmd[k],
-        joint_lower_limit,
-        joint_upper_limit,
-    )
-
-    The initial state is taken from the initial_joint_position input during
-    initialization.
+    The active velocity input is selected by an InputPortIndex received on an
+    abstract input port. Whenever the selected input changes, the integrator is
+    synchronized to the measured joint position before integration continues.
     """
 
     def __init__(
         self,
         time_step: float,
+        num_velocity_inputs: int,
         num_joints: int = 7,
         joint_lower_limit: float | list[float] = -np.inf,
         joint_upper_limit: float | list[float] = np.inf,
     ):
         super().__init__()
 
-        self._num_joints = num_joints
         self._time_step = time_step
 
         lower = np.asarray(joint_lower_limit, dtype=float)
@@ -212,7 +208,6 @@ class IntegratedVelocityController(LeafSystem):
 
         if lower.ndim == 0:
             lower = np.full(num_joints, lower)
-
         if upper.ndim == 0:
             upper = np.full(num_joints, upper)
 
@@ -222,42 +217,59 @@ class IntegratedVelocityController(LeafSystem):
         self._lower = lower
         self._upper = upper
 
-        self.velocity_input_port = self.DeclareVectorInputPort(
-            "velocity", num_joints
+        self.active_input_port = self.DeclareAbstractInputPort(
+            "active_input",
+            AbstractValue.Make(InputPortIndex(0)),
         )
 
-        self.initial_position_input_port = self.DeclareVectorInputPort(
-            "initial_position", num_joints
+        self.velocity_input_ports = [
+            self.DeclareVectorInputPort(
+                f"velocity_{i}",
+                num_joints,
+            )
+            for i in range(num_velocity_inputs)
+        ]
+
+        self.position_measured_input_port = self.DeclareVectorInputPort(
+            "position_measured",
+            num_joints,
         )
 
-        state_index = self.DeclareDiscreteState(num_joints)
+        self._position_state_index = self.DeclareDiscreteState(num_joints)
 
-        self.DeclareStateOutputPort("position", state_index)
-
-        self.DeclareInitializationDiscreteUpdateEvent(
-            self._InitializeState
+        self._active_input_state_index = self.DeclareAbstractState(
+            AbstractValue.Make(InputPortIndex(0))
         )
 
-        self.DeclarePeriodicDiscreteUpdateEvent(
+        self.DeclareStateOutputPort(
+            "position",
+            self._position_state_index,
+        )
+
+        self.DeclarePeriodicUnrestrictedUpdateEvent(
             period_sec=time_step,
             offset_sec=0.0,
-            update=self._DiscreteUpdate,
+            update=self._Update,
         )
 
-    def _InitializeState(self, context, discrete_state):
-        q0 = self.initial_position_input_port.Eval(context)
-        q0 = np.clip(q0, self._lower, self._upper)
-        discrete_state.set_value(q0)
-        print(f"[INFO] Initial joint position {q0}")
+    def _Update(self, context, state):
+        q = context.get_discrete_state(self._position_state_index).value().copy()
 
-    def _DiscreteUpdate(self, context, discrete_state):
-        q = context.get_discrete_state_vector().value()
-        v = self.velocity_input_port.Eval(context)
+        previous_active = context.get_abstract_state(self._active_input_state_index).get_value()
+
+        active = self.active_input_port.Eval(context)
+
+        if active != previous_active:
+            q = self.position_measured_input_port.Eval(context).copy()
+
+        v = self.get_input_port(active).Eval(context)
 
         q_next = q + self._time_step * v
         q_next = np.clip(q_next, self._lower, self._upper)
 
-        discrete_state.set_value(q_next)
+        state.get_mutable_discrete_state(self._position_state_index).set_value(q_next)
+
+        state.get_mutable_abstract_state(self._active_input_state_index).set_value(active)
 
 
 class JointVelocityController(Diagram):
@@ -613,7 +625,7 @@ class CartesianPoseController(Diagram):
         builder.BuildInto(self)
 
 
-class IiwaOperatingMode(Enum):
+class CommandMode(Enum):
     JOINT_VEL = "joint_vel"
     JOINT_POS = "joint_pos"
     CARTESIAN_VEL = "cartesian_vel"
@@ -621,44 +633,39 @@ class IiwaOperatingMode(Enum):
 
 
 class IiwaRosInterface(Node):
-    def __init__(self, namespace: str, operating_mode: IiwaOperatingMode):
+    def __init__(self, namespace: str):
         super().__init__(namespace)
 
         self._lock = threading.Lock()
 
+        self._command_mode = None
         self._command_value = None
         self._new_command = False
 
-        if operating_mode == IiwaOperatingMode.JOINT_VEL:
-            self.create_subscription(
-                JointState,
-                f"/{namespace}/cmd_joint_vel",
-                self._CmdJointVelCallback,
-                1,
-            )
-        elif operating_mode == IiwaOperatingMode.JOINT_POS:
-            self.create_subscription(
-                JointState,
-                f"/{namespace}/cmd_joint_pos",
-                self._CmdJointPosCallback,
-                1,
-            )
-        elif operating_mode == IiwaOperatingMode.CARTESIAN_VEL:
-            self.create_subscription(
-                TwistStamped,
-                f"/{namespace}/cmd_cartesian_vel",
-                self._CmdCartesianVelCallback,
-                1,
-            )
-        elif operating_mode == IiwaOperatingMode.CARTESIAN_POS:
-            self.create_subscription(
-                PoseStamped,
-                f"/{namespace}/cmd_cartesian_pos",
-                self._CmdCartesianPosCallback,
-                1,
-            )
-        else:
-            raise ValueError(f'Invalid control mode {operating_mode}')
+        self.create_subscription(
+            JointState,
+            f"/{namespace}/cmd_joint_vel",
+            self._CmdJointVelCallback,
+            1,
+        )
+        self.create_subscription(
+            JointState,
+            f"/{namespace}/cmd_joint_pos",
+            self._CmdJointPosCallback,
+            1,
+        )
+        self.create_subscription(
+            TwistStamped,
+            f"/{namespace}/cmd_cartesian_vel",
+            self._CmdCartesianVelCallback,
+            1,
+        )
+        self.create_subscription(
+            PoseStamped,
+            f"/{namespace}/cmd_cartesian_pos",
+            self._CmdCartesianPosCallback,
+            1,
+        )
 
         self._joint_state_pub = self.create_publisher(
             JointState,
@@ -672,6 +679,7 @@ class IiwaRosInterface(Node):
             return
 
         with self._lock:
+            self._command_mode = CommandMode.JOINT_VEL
             self._command_value = np.array(msg.velocity)
             self._new_command = True
             self.get_logger().info(f"Received joint velocity command {self._command_value}")
@@ -682,44 +690,45 @@ class IiwaRosInterface(Node):
             return
 
         with self._lock:
+            self._command_mode = CommandMode.JOINT_POS
             self._command_value = np.array(msg.position)
             self._new_command = True
             self.get_logger().info(f"Received joint position command {self._command_value}")
 
     def _CmdCartesianVelCallback(self, msg: TwistStamped):
-        t = msg.twist
-
-        linear = np.array([t.linear.x, t.linear.y, t.linear.z])
-        angular = np.array([t.angular.x, t.angular.y, t.angular.z])
+        twist = msg.twist
+        linear = np.array([twist.linear.x, twist.linear.y, twist.linear.z])
+        angular = np.array([twist.angular.x, twist.angular.y, twist.angular.z])
 
         V_WT =  SpatialVelocity(angular, linear)
 
         with self._lock:
+            self._command_mode = CommandMode.CARTESIAN_VEL
             self._command_value = V_WT
             self._new_command = True
             self.get_logger().info(f"Received cartesian velocity command {self._command_value}")
 
     def _CmdCartesianPosCallback(self, msg: PoseStamped):
         p = msg.pose
-
         translation = np.array([p.position.x, p.position.y, p.position.z])
-
         quaternion = Quaternion(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z)
 
         X_WT = RigidTransform(RotationMatrix(quaternion), translation)
 
         with self._lock:
+            self._command_mode = CommandMode.CARTESIAN_POS
             self._command_value = X_WT
             self._new_command = True
             self.get_logger().info(f"Received cartesian pose command {self._command_value}")
 
     def ConsumeCommand(self):
         with self._lock:
+            command_mode = self._command_mode
             command_value = copy.copy(self._command_value)
             new_command = self._new_command
             self._new_command = False
 
-        return command_value, new_command
+        return command_mode, command_value, new_command
 
     def publish_joint_state(
         self,
@@ -739,72 +748,108 @@ class IiwaRosInterface(Node):
         self._joint_state_pub.publish(msg)
 
 
-class RosJointPositionSource(LeafSystem):
-    def __init__(self, ros_interface):
+class RosCommandSource(LeafSystem):
+    def __init__(self, ros_interface: IiwaRosInterface):
         super().__init__()
 
         self._ros_interface = ros_interface
 
-        self.DeclareVectorOutputPort("desired_position", 7, self._CalcOutput)
+        self._mode_state = self.DeclareAbstractState(
+            AbstractValue.Make(None)
+        )
+        self._value_state = self.DeclareAbstractState(
+            AbstractValue.Make(None)
+        )
 
-    def _CalcOutput(self, context, output):
-        qpos, new = self._ros_interface.ConsumeCommand()
-        if qpos is None:
-            qpos = np.full(7, np.nan)
-        output.SetFromVector(qpos)
+        self.DeclarePerStepUnrestrictedUpdateEvent(self._Update)
 
+        self.DeclareAbstractOutputPort(
+            "active_port",
+            lambda: AbstractValue.Make(InputPortIndex(0)),
+            self._CalcActivePort,
+        )
 
-class RosJointVelocitySource(LeafSystem):
-    def __init__(self, ros_interface):
-        super().__init__()
+        self.DeclareVectorOutputPort(
+            "desired_joint_velocity",
+            7,
+            self._CalcJointVelocity,
+        )
 
-        self._ros_interface = ros_interface
-
-        self.DeclareVectorOutputPort("desired_velocity", 7, self._CalcOutput)
-
-    def _CalcOutput(self, context, output):
-        qvel, new = self._ros_interface.ConsumeCommand()
-        if qvel is None:
-            qvel = np.zeros(7)
-        output.SetFromVector(qvel)
-
-
-class RosCartesianVelocitySource(LeafSystem):
-    def __init__(self, ros_interface):
-        super().__init__()
-
-        self._ros_interface = ros_interface
+        self.DeclareVectorOutputPort(
+            "desired_joint_position",
+            7,
+            self._CalcJointPosition,
+        )
 
         self.DeclareAbstractOutputPort(
             "desired_cartesian_velocity",
-            lambda: AbstractValue.Make(SpatialVelocity()),
-            self._CalcOutput,
+            lambda: AbstractValue.Make(SpatialVelocity.Zero()),
+            self._CalcCartesianVelocity,
         )
-
-    def _CalcOutput(self, context, output):
-        cart_vel, new = self._ros_interface.ConsumeCommand()
-        if cart_vel is None:
-            cart_vel = SpatialVelocity(np.zeros(6))
-        output.set_value(cart_vel)
-
-
-class RosCartesianPoseSource(LeafSystem):
-    def __init__(self, ros_interface):
-        super().__init__()
-
-        self._ros_interface = ros_interface
 
         self.DeclareAbstractOutputPort(
             "desired_cartesian_pose",
             lambda: AbstractValue.Make(RigidTransform()),
-            self._CalcOutput,
+            self._CalcCartesianPose,
         )
 
-    def _CalcOutput(self, context, output):
-        pose, new = self._ros_interface.ConsumeCommand()
-        if pose is None:
-            pose = RigidTransform(np.full(3, np.nan))
-        output.set_value(pose)
+    def _Update(self, context, state):
+        mode, value, new = self._ros_interface.ConsumeCommand()
+        if not new:
+            return
+
+        state.get_mutable_abstract_state(int(self._mode_state)).set_value(mode)
+        state.get_mutable_abstract_state(int(self._value_state)).set_value(value)
+
+    def _GetCommand(self, context):
+        mode = context.get_abstract_state(int(self._mode_state)).get_value()
+        value = context.get_abstract_state(int(self._value_state)).get_value()
+        return mode, value
+
+    def _CalcActivePort(self, context, output):
+        mode, _ = self._GetCommand(context)
+
+        mapping = {
+            None: 1,
+            CommandMode.JOINT_VEL: 1,
+            CommandMode.JOINT_POS: 2,
+            CommandMode.CARTESIAN_VEL: 3,
+            CommandMode.CARTESIAN_POS: 4,
+        }
+
+        output.set_value(InputPortIndex(mapping[mode]))
+
+    def _CalcJointVelocity(self, context, output):
+        mode, value = self._GetCommand(context)
+
+        if mode == CommandMode.JOINT_VEL and value is not None:
+            output.SetFromVector(value)
+        else:
+            output.SetFromVector(np.zeros(7))
+
+    def _CalcJointPosition(self, context, output):
+        mode, value = self._GetCommand(context)
+
+        if mode == CommandMode.JOINT_POS and value is not None:
+            output.SetFromVector(value)
+        else:
+            output.SetFromVector(np.full(7, np.nan))
+
+    def _CalcCartesianVelocity(self, context, output):
+        mode, value = self._GetCommand(context)
+
+        if mode == CommandMode.CARTESIAN_VEL and value is not None:
+            output.set_value(value)
+        else:
+            output.set_value(SpatialVelocity.Zero())
+
+    def _CalcCartesianPose(self, context, output):
+        mode, value = self._GetCommand(context)
+
+        if mode == CommandMode.CARTESIAN_POS and value is not None:
+            output.set_value(value)
+        else:
+            output.set_value(RigidTransform(np.full(3, np.nan)))
 
 
 class Iiwa7System(Diagram):
@@ -812,7 +857,6 @@ class Iiwa7System(Diagram):
         self,
         lcm: DrakeLcmInterface,
         ros_interface: IiwaRosInterface,
-        operating_mode: IiwaOperatingMode,
         max_joint_velocity: float | list[float],
         max_linear_velocity: float | list[float],
         max_angular_velocity: float | list[float],
@@ -833,7 +877,8 @@ class Iiwa7System(Diagram):
             )
         )
         integrated_velocity = builder.AddSystem(
-            IntegratedVelocityController(
+            IntegratedVelocitySwitch(
+                num_velocity_inputs=4,
                 time_step=time_step,
                 joint_lower_limit=joint_lower_limit,
                 joint_upper_limit=joint_upper_limit,
@@ -845,86 +890,90 @@ class Iiwa7System(Diagram):
         )
         builder.Connect(
             robot.GetOutputPort("position_measured"),
-            integrated_velocity.GetInputPort("initial_position"),
+            integrated_velocity.GetInputPort("position_measured"),
         )
 
-        if operating_mode == IiwaOperatingMode.JOINT_VEL:
-            controller = builder.AddSystem(
-                JointVelocityController(max_velocity=max_joint_velocity)
-            )
-            command_source = builder.AddSystem(
-                RosJointVelocitySource(ros_interface)
-            )
-            builder.Connect(
-                command_source.get_output_port(),
-                controller.GetInputPort("desired_velocity"),
-            )
-
-        elif operating_mode == IiwaOperatingMode.JOINT_POS:
-            controller = builder.AddSystem(
-                JointPositionController(
-                    time_step=time_step,
-                    max_velocity=max_joint_velocity,
-                )
-            )
-            command_source = builder.AddSystem(
-                RosJointPositionSource(ros_interface)
-            )
-            builder.Connect(
-                integrated_velocity.GetOutputPort("position"),
-                controller.GetInputPort("position"),
-            )
-            builder.Connect(
-                command_source.get_output_port(),
-                controller.GetInputPort("desired_position"),
-            )
-
-        elif operating_mode == IiwaOperatingMode.CARTESIAN_VEL:
-            controller = builder.AddSystem(
-                CartesianVelocityController(
-                    time_step=time_step,
-                    max_linear_velocity=max_linear_velocity,
-                    max_angular_velocity=max_angular_velocity,
-                )
-            )
-            command_source = builder.AddSystem(
-                RosCartesianVelocitySource(ros_interface)
-            )
-            builder.Connect(
-                integrated_velocity.GetOutputPort("position"),
-                controller.GetInputPort("position"),
-            )
-            builder.Connect(
-                command_source.get_output_port(),
-                controller.GetInputPort("desired_cartesian_velocity"),
-            )
-
-        elif operating_mode == IiwaOperatingMode.CARTESIAN_POS:
-            controller = builder.AddSystem(
-                CartesianPoseController(
-                    time_step=time_step,
-                    max_linear_velocity=max_linear_velocity,
-                    max_angular_velocity=max_angular_velocity,
-                )
-            )
-            command_source = builder.AddSystem(
-                RosCartesianPoseSource(ros_interface)
-            )
-            builder.Connect(
-                integrated_velocity.GetOutputPort("position"),
-                controller.GetInputPort("position"),
-            )
-            builder.Connect(
-                command_source.get_output_port(),
-                controller.GetInputPort("desired_cartesian_pose"),
-            )
-
-        else:
-            raise ValueError(f'Invalid operating mode {operating_mode}')
-
+        command_source = builder.AddSystem(
+            RosCommandSource(ros_interface)
+        )
         builder.Connect(
-            controller.GetOutputPort("commanded_velocity"),
-            integrated_velocity.GetInputPort("velocity"),
+            command_source.GetOutputPort("active_port"),
+            integrated_velocity.GetInputPort("active_input"),
+        )
+
+        # Joint velocity controller
+        joint_vel_controller = builder.AddSystem(
+            JointVelocityController(max_velocity=max_joint_velocity)
+        )
+        builder.Connect(
+            command_source.GetOutputPort("desired_joint_velocity"),
+            joint_vel_controller.GetInputPort("desired_velocity"),
+        )
+        builder.Connect(
+            joint_vel_controller.GetOutputPort("commanded_velocity"),
+            integrated_velocity.get_input_port(1),
+        )
+
+        # Joint position controller
+        joint_pos_controller = builder.AddSystem(
+            JointPositionController(
+                time_step=time_step,
+                max_velocity=max_joint_velocity,
+            )
+        )
+        builder.Connect(
+            integrated_velocity.GetOutputPort("position"),
+            joint_pos_controller.GetInputPort("position"),
+        )
+        builder.Connect(
+            command_source.GetOutputPort("desired_joint_position"),
+            joint_pos_controller.GetInputPort("desired_position"),
+        )
+        builder.Connect(
+            joint_pos_controller.GetOutputPort("commanded_velocity"),
+            integrated_velocity.get_input_port(2),
+        )
+
+        # Cartesian velocity controller
+        cartesian_vel_controller = builder.AddSystem(
+            CartesianVelocityController(
+                time_step=time_step,
+                max_linear_velocity=max_linear_velocity,
+                max_angular_velocity=max_angular_velocity,
+            )
+        )
+        builder.Connect(
+            integrated_velocity.GetOutputPort("position"),
+            cartesian_vel_controller.GetInputPort("position"),
+        )
+        builder.Connect(
+            command_source.GetOutputPort("desired_cartesian_velocity"),
+            cartesian_vel_controller.GetInputPort("desired_cartesian_velocity"),
+        )
+        builder.Connect(
+            cartesian_vel_controller.GetOutputPort("commanded_velocity"),
+            integrated_velocity.get_input_port(3),
+        )
+
+        # Cartesian pose controller
+        cartesian_pos_controller = builder.AddSystem(
+            CartesianPoseController(
+                time_step=time_step,
+                max_linear_velocity=max_linear_velocity,
+                max_angular_velocity=max_angular_velocity,
+            )
+        )
+        builder.Connect(
+            integrated_velocity.GetOutputPort("position"),
+            cartesian_pos_controller.GetInputPort("position"),
+        )
+        builder.Connect(
+            command_source.GetOutputPort("desired_cartesian_pose"),
+            cartesian_pos_controller.GetInputPort("desired_cartesian_pose"),
+        )
+        builder.Connect(
+            cartesian_pos_controller.GetOutputPort("commanded_velocity"),
+            integrated_velocity.get_input_port(4),
         )
 
         builder.BuildInto(self)
@@ -932,7 +981,6 @@ class Iiwa7System(Diagram):
 
 @dataclass
 class Iiwa7SystemsConfig:
-    operating_mode: IiwaOperatingMode
     enable_left_arm: bool
     enable_right_arm: bool
     max_joint_velocity: float | list[float] = 1.0
@@ -962,7 +1010,6 @@ def AddIiwa7Systems(
 
         ros_interface = IiwaRosInterface(
             namespace=ros_namespaces[k],
-            operating_mode=config.operating_mode,
         )
         rclpy_executor.add_node(ros_interface)
 
@@ -971,7 +1018,6 @@ def AddIiwa7Systems(
                 lcm=lcm,
                 lcm_channel_suffix=lcm_channel_suffixs[k],
                 ros_interface=ros_interface,
-                operating_mode=config.operating_mode,
                 max_joint_velocity=config.max_joint_velocity,
                 max_linear_velocity=config.max_linear_velocity,
                 max_angular_velocity=config.max_angular_velocity,
