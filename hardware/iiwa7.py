@@ -43,6 +43,7 @@ from pydrake.all import (
     JointLimits,
     InputPortIndex,
     PortSwitch,
+    FixedOffsetFrame,
 )
 
 import rclpy
@@ -51,11 +52,6 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from sensor_msgs.msg import JointState
 
-
-def AddLcm(builder: DiagramBuilder):
-    lcm = DrakeLcm()
-    builder.AddSystem(LcmInterfaceSystem(lcm))
-    return lcm
 
 
 class IiwaRobot(Diagram):
@@ -357,6 +353,7 @@ class JointPositionController(LeafSystem):
 
 
 def Iiwa7DifferentialInverseKinematics(
+        end_effector_z_offset: float,
         time_step: float,
         max_linear_velocity: float | list[float],
         max_angular_velocity: float | list[float],
@@ -376,11 +373,18 @@ def Iiwa7DifferentialInverseKinematics(
         "package://drake_models/iiwa_description/sdf/iiwa7_no_collision.sdf"
     )[0]
 
-
     plant.WeldFrames(
         plant.world_frame(),
         plant.GetFrameByName("iiwa_link_0", iiwa_instance),
         RigidTransform(),
+    )
+
+    plant.AddFrame(
+        FixedOffsetFrame(
+            name="iiwa_ee",
+            P=plant.GetFrameByName("iiwa_link_7", iiwa_instance),
+            X_PF=RigidTransform([0.0, 0.0, end_effector_z_offset]),
+        )
     )
 
     robot_diagram = robot_builder.Build()
@@ -395,7 +399,7 @@ def Iiwa7DifferentialInverseKinematics(
         )
     )
 
-    ee_frame = plant.GetFrameByName("iiwa_link_7").scoped_name().get_full()
+    ee_frame = plant.GetFrameByName("iiwa_ee").scoped_name().get_full()
     task_frame = plant.world_frame().scoped_name().get_full()
 
     cartesian_axis_masks = { ee_frame: np.ones(6) }
@@ -455,6 +459,7 @@ class CartesianVelocityController(Diagram):
 
     def __init__(
         self,
+        end_effector_z_offset: float,
         time_step: float,
         max_linear_velocity: float | list[float],
         max_angular_velocity: float | list[float],
@@ -464,6 +469,7 @@ class CartesianVelocityController(Diagram):
         builder = DiagramBuilder()
 
         diff_ik, ee_frame = Iiwa7DifferentialInverseKinematics(
+            end_effector_z_offset=end_effector_z_offset,
             time_step=time_step,
             max_linear_velocity=max_linear_velocity,
             max_angular_velocity=max_angular_velocity,
@@ -518,6 +524,7 @@ class CartesianPoseController(Diagram):
 
     def __init__(
         self,
+        end_effector_z_offset: float,
         time_step: float,
         max_linear_velocity: float | list[float],
         max_angular_velocity: float | list[float],
@@ -527,6 +534,7 @@ class CartesianPoseController(Diagram):
         builder = DiagramBuilder()
 
         diff_ik, ee_frame = Iiwa7DifferentialInverseKinematics(
+            end_effector_z_offset=end_effector_z_offset,
             time_step=time_step,
             max_linear_velocity=max_linear_velocity,
             max_angular_velocity=max_angular_velocity,
@@ -672,6 +680,8 @@ class IiwaRosInterface(Node):
             f"/{namespace}/joint_states",
             10,
         )
+
+        self.get_logger().info(f"Using namespace /{namespace} for ROS communication")
 
     def _CmdJointVelCallback(self, msg: JointState):
         if len(msg.velocity) != 7:
@@ -861,6 +871,7 @@ class Iiwa7System(Diagram):
         max_linear_velocity: float | list[float],
         max_angular_velocity: float | list[float],
         time_step: float,
+        end_effector_z_offset: float,
         lcm_channel_suffix: str = "",
         joint_upper_limit = np.deg2rad(np.array([170, 120, 170, 120, 170, 120, 175])),
         joint_lower_limit = np.deg2rad(-np.array([170, 120, 170, 120, 170, 120, 175])),
@@ -937,6 +948,7 @@ class Iiwa7System(Diagram):
         # Cartesian velocity controller
         cartesian_vel_controller = builder.AddSystem(
             CartesianVelocityController(
+                end_effector_z_offset=end_effector_z_offset,
                 time_step=time_step,
                 max_linear_velocity=max_linear_velocity,
                 max_angular_velocity=max_angular_velocity,
@@ -958,6 +970,7 @@ class Iiwa7System(Diagram):
         # Cartesian pose controller
         cartesian_pos_controller = builder.AddSystem(
             CartesianPoseController(
+                end_effector_z_offset=end_effector_z_offset,
                 time_step=time_step,
                 max_linear_velocity=max_linear_velocity,
                 max_angular_velocity=max_angular_velocity,
@@ -979,27 +992,37 @@ class Iiwa7System(Diagram):
         builder.BuildInto(self)
 
 
-@dataclass
-class Iiwa7SystemsConfig:
-    enable_left_arm: bool
-    enable_right_arm: bool
-    max_joint_velocity: float | list[float] = 1.0
-    max_linear_velocity: float | list[float] = 0.5
-    max_angular_velocity: float | list[float] = 1.8
-    time_step: float = 0.005
+def CheckLcmActive(lcm_channel_suffix: str):
+    lcm = DrakeLcm()
+    lcm.Subscribe("IIWA_STATUS" + lcm_channel_suffix, lambda s: s)
+    count = lcm.HandleSubscriptions(100)
+    return count > 0
+
+
+def AddLcm(builder: DiagramBuilder):
+    lcm = DrakeLcm()
+    builder.AddSystem(LcmInterfaceSystem(lcm))
+    return lcm
 
 
 def AddIiwa7Systems(
     diagram_builder: DiagramBuilder,
     rclpy_executor: rclpy.executors.Executor,
-    config: Iiwa7SystemsConfig,
+    max_joint_velocity: float | list[float] = 1.0,
+    max_linear_velocity: float | list[float] = 0.5,
+    max_angular_velocity: float | list[float] = 1.8,
 ) -> None:
 
-    ros_namespaces = ["left_arm", "right_arm"]
+    ros_namespaces = ["left_iiwa", "right_iiwa"]
     lcm_channel_suffixs = ["", "_2"]
-    enabled = [config.enable_left_arm, config.enable_right_arm]
+    end_effector_z_offsets = [
+        0.045,  # old flange face is 45mm from link7 frame
+        0.071,  # new flange face is 71mm from link7 frame
+    ]
+    enabled = [CheckLcmActive(s) for s in lcm_channel_suffixs]
 
     if not any(enabled):
+        print("No IIWA robot found.")
         return
 
     lcm = AddLcm(diagram_builder)
@@ -1008,9 +1031,7 @@ def AddIiwa7Systems(
         if not enabled[k]:
             continue
 
-        ros_interface = IiwaRosInterface(
-            namespace=ros_namespaces[k],
-        )
+        ros_interface = IiwaRosInterface(namespace=ros_namespaces[k])
         rclpy_executor.add_node(ros_interface)
 
         diagram_builder.AddSystem(
@@ -1018,9 +1039,10 @@ def AddIiwa7Systems(
                 lcm=lcm,
                 lcm_channel_suffix=lcm_channel_suffixs[k],
                 ros_interface=ros_interface,
-                max_joint_velocity=config.max_joint_velocity,
-                max_linear_velocity=config.max_linear_velocity,
-                max_angular_velocity=config.max_angular_velocity,
-                time_step=config.time_step,
+                end_effector_z_offset=end_effector_z_offsets[k],
+                max_joint_velocity=max_joint_velocity,
+                max_linear_velocity=max_linear_velocity,
+                max_angular_velocity=max_angular_velocity,
+                time_step=0.005,
             )
         )

@@ -9,35 +9,12 @@ from pydrake.all import (
     Simulator,
 )
 
-from hardware.iiwa7 import AddIiwa7Systems, Iiwa7SystemsConfig
+from hardware.iiwa7 import AddIiwa7Systems
 
 
 def parse_args():
-    def str2bool(v):
-        if isinstance(v, bool):
-            return v
-        if v.lower() in ("true", "1", "yes", "y"):
-            return True
-        if v.lower() in ("false", "0", "no", "n"):
-            return False
-        raise argparse.ArgumentTypeError("Boolean value expected.")
-
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-
-    parser.add_argument(
-        "--enable_left",
-        type=str2bool,
-        default=True,
-        help="Enable left robot.",
-    )
-
-    parser.add_argument(
-        "--enable_right",
-        type=str2bool,
-        default=True,
-        help="Enable right robot.",
     )
 
     parser.add_argument(
@@ -96,18 +73,12 @@ def main():
 
     diagram_builder = DiagramBuilder()
 
-    config = Iiwa7SystemsConfig(
-        enable_left_arm=args.enable_left,
-        enable_right_arm=args.enable_right,
-        max_joint_velocity=args.max_joint_vel,
-        max_linear_velocity=args.max_linear_vel,
-        max_angular_velocity=args.max_angular_vel,
-    )
-
     AddIiwa7Systems(
         diagram_builder=diagram_builder,
         rclpy_executor=rclpy_executor,
-        config=config,
+        max_joint_velocity=args.max_joint_vel,
+        max_linear_velocity=args.max_linear_vel,
+        max_angular_velocity=args.max_angular_vel,
     )
 
     ros_thread = threading.Thread(
