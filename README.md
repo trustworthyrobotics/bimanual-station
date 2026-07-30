@@ -21,10 +21,19 @@ source .venv/bin/activate
 
 ### `iiwa_driver`
 
-The `iiwa_driver` executable communicates with a KUKA IIWA robot through the Fast Robot Interface (FRI).
+The `iiwa_driver` executable connects a KUKA IIWA robot to the host computer using the KUKA Fast Robot Interface (FRI).
 
-To connect to the **left IIWA**, run:
+Before launching the driver, on the KUKA smartPAD, start the appropriate FRI application:
 
+| Application                         | Description                   |
+| ----------------------------------- | ----------------------------- |
+| `FRIPositionDriver`                 | No compliance                 |
+| `FRIJointImpedanceDriver(Tool)`     | Compliance in joint space     |
+| `FRICartesianImpedanceDriver(Tool)` | Compliance in Cartesian space |
+
+On the host computer, launch the driver for the desired robot:
+
+**Left IIWA**
 ```bash
 ./iiwa_driver \
     --fri_ip 192.170.10.2 \
@@ -33,8 +42,7 @@ To connect to the **left IIWA**, run:
     --lcm_status_channel IIWA_STATUS
 ```
 
-To connect to the **right IIWA**, run:
-
+**Right IIWA**
 ```bash
 ./iiwa_driver \
     --fri_ip 192.170.10.3 \
@@ -43,20 +51,21 @@ To connect to the **right IIWA**, run:
     --lcm_status_channel IIWA_STATUS_2
 ```
 
+
 ### `bimanual_station.py`
 
-The `bimanual_station.py` script provides ROS 2 interfaces for controlling the IIWA robots in four control modes:
+The `bimanual_station.py` script provides ROS 2 topics for commanding the IIWA robots in four modes:
 
-| Control mode       | ROS 2 topic                      |
-| ------------------ | -------------------------------- |
-| Joint velocity     | `/<namespace>/cmd_joint_vel`     |
-| Joint position     | `/<namespace>/cmd_joint_pos`     |
-| Cartesian velocity | `/<namespace>/cmd_cartesian_vel` |
-| Cartesian pose     | `/<namespace>/cmd_cartesian_pos` |
+| Command mode       | ROS 2 topic                      | ROS 2 message type               |
+| ------------------ | -------------------------------- | -------------------------------- |
+| Joint velocity     | `/<namespace>/cmd_joint_vel`     | `sensor_msgs/msg/JointState`     |
+| Joint position     | `/<namespace>/cmd_joint_pos`     | `sensor_msgs/msg/JointState`     |
+| Cartesian velocity | `/<namespace>/cmd_cartesian_vel` | `geometry_msgs/msg/TwistStamped` |
+| Cartesian pose     | `/<namespace>/cmd_cartesian_pos` | `geometry_msgs/msg/PoseStamped`  |
 
-where `<namespace>` is either `left_iiwa` or `right_iiwa`.
+where `<namespace>` is either `left_iiwa` or `right_iiwa`. There are also topics for reporting the joint state and Cartesian state.
 
-The maximum joint velocity, cartesian linear velocity, cartesian angular velocity, and tool offset can be configured through command-line arguments:
+The joint velocity limit, Cartesian linear/angular velocity limit, and the tool offset can be configured through command-line arguments:
 
 ```bash
 bimanual_station.py \
