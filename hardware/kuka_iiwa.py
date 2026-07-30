@@ -1,60 +1,29 @@
 import copy
 import threading
-from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
 
-from drake import (
-    lcmt_iiwa_command,
-    lcmt_iiwa_status,
-)
-from pydrake.all import (
-    Gain,
-    OutputPort,
-    Diagram,
-    DiagramBuilder,
-    IiwaCommandSender,
-    IiwaControlMode,
-    IiwaStatusReceiver,
-    LcmPublisherSystem,
-    LcmSubscriberSystem,
-    position_enabled,
-    torque_enabled,
-    Multiplexer,
-    DrakeLcmInterface,
-    DrakeLcm,
-    Saturation,
-    LcmInterfaceSystem,
-    LeafSystem,
-    BusCreator,
-    RigidTransform,
-    AbstractValue,
-    DifferentialInverseKinematicsSystem,
-    RobotDiagramBuilder,
-    SceneGraphCollisionChecker,
-    Parser,
-    CollisionCheckerParams,
-    SpatialVelocity,
-    DofMask,
-    RotationMatrix,
-    Quaternion,
-    ConstantVectorSource,
-    JointLimits,
-    InputPortIndex,
-    PortSwitch,
-    FixedOffsetFrame,
-    MultibodyPlant,
-    ModelInstanceIndex,
-    Frame,
-)
+from drake import lcmt_iiwa_command, lcmt_iiwa_status
+from pydrake.all import (AbstractValue, BusCreator, CollisionCheckerParams,
+                         ConstantVectorSource, Diagram, DiagramBuilder,
+                         DifferentialInverseKinematicsSystem, DofMask,
+                         DrakeLcm, DrakeLcmInterface, FixedOffsetFrame, Frame,
+                         Gain, IiwaCommandSender, IiwaControlMode,
+                         IiwaStatusReceiver, InputPortIndex,
+                         JacobianWrtVariable, JointLimits, LcmInterfaceSystem,
+                         LcmPublisherSystem, LcmSubscriberSystem, LeafSystem,
+                         ModelInstanceIndex, MultibodyPlant, OutputPort,
+                         Parser, PortSwitch, Quaternion, RigidTransform,
+                         RobotDiagramBuilder, RotationMatrix, Saturation,
+                         SceneGraphCollisionChecker, SpatialForce,
+                         SpatialVelocity, ValueProducer, position_enabled,
+                         torque_enabled)
 
 import rclpy
 from rclpy.node import Node
-
-from geometry_msgs.msg import PoseStamped, TwistStamped
+from geometry_msgs.msg import PoseStamped, TwistStamped, WrenchStamped
 from sensor_msgs.msg import JointState
-
 
 
 class IiwaRobot(Diagram):
@@ -381,7 +350,6 @@ class IiwaForwardKinematics(LeafSystem):
 
         self._plant = plant
         self._ee_frame = ee_frame
-        self._plant_context = plant.CreateDefaultContext()
 
         self._position_input_port = self.DeclareVectorInputPort(
             "position", plant.num_positions()
@@ -389,6 +357,22 @@ class IiwaForwardKinematics(LeafSystem):
 
         self._velocity_input_port = self.DeclareVectorInputPort(
             "velocity", plant.num_velocities()
+        )
+
+        self._torque_input_port = self.DeclareVectorInputPort(
+            "torque", plant.num_velocities()
+        )
+
+        self._plant_context_cache = self.DeclareCacheEntry(
+            "plant_context",
+            ValueProducer(
+                lambda: AbstractValue.Make(self._plant.CreateDefaultContext()),
+                self._CalcPlantContext,
+            ),
+            prerequisites_of_calc = {
+                self._position_input_port.ticket(),
+                self._velocity_input_port.ticket(),
+            },
         )
 
         self.DeclareAbstractOutputPort(
@@ -403,25 +387,49 @@ class IiwaForwardKinematics(LeafSystem):
             self._CalcCartesianVelocity,
         )
 
+        self.DeclareAbstractOutputPort(
+            "cartesian_wrench",
+            lambda: AbstractValue.Make(SpatialForce()),
+            self._CalcCartesianWrench,
+        )
+
+    def _CalcPlantContext(self, context, value):
+        plant_context = value.get_mutable_value()
+
+        q = self._position_input_port.Eval(context)
+        v = self._velocity_input_port.Eval(context)
+
+        self._plant.SetPositions(plant_context, q)
+        self._plant.SetVelocities(plant_context, v)
+
     def _CalcCartesianPose(self, context, output):
-        position = self._position_input_port.Eval(context)
-
-        self._plant.SetPositions(self._plant_context, position)
-
-        X_WT = self._ee_frame.CalcPoseInWorld(self._plant_context)
-
+        plant_context = self._plant_context_cache.Eval(context)
+        X_WT = self._ee_frame.CalcPoseInWorld(plant_context)
         output.set_value(X_WT)
 
     def _CalcCartesianVelocity(self, context, output):
-        position = self._position_input_port.Eval(context)
-        velocity = self._velocity_input_port.Eval(context)
-
-        self._plant.SetPositions(self._plant_context, position)
-        self._plant.SetVelocities(self._plant_context, velocity)
-
-        V_WT = self._ee_frame.CalcSpatialVelocityInWorld(self._plant_context)
-
+        plant_context = self._plant_context_cache.Eval(context)
+        V_WT = self._ee_frame.CalcSpatialVelocityInWorld(plant_context)
         output.set_value(V_WT)
+
+    def _CalcCartesianWrench(self, context, output):
+        plant_context = self._plant_context_cache.Eval(context)
+
+        tau = self._torque_input_port.Eval(context)
+
+        J = self._plant.CalcJacobianSpatialVelocity(
+            context=plant_context,
+            with_respect_to=JacobianWrtVariable.kV,
+            frame_B=self._ee_frame,
+            p_BoBp_B=np.zeros(3),
+            frame_A=self._plant.world_frame(),
+            frame_E=self._plant.world_frame(),
+        )
+
+        wrench = np.linalg.lstsq(J.T, tau)[0]
+        F_WT = SpatialForce(tau=wrench[:3], f=wrench[3:])
+
+        output.set_value(F_WT)
 
 
 def IiwaDifferentialInverseKinematics(
@@ -769,6 +777,11 @@ class IiwaRosInterface(Node):
             f"/{namespace}/cartesian_velocity_estimated",
             10,
         )
+        self._cartesian_wrench_estimated_pub = self.create_publisher(
+            WrenchStamped,
+            f"/{namespace}/cartesian_wrench_estimated",
+            10,
+        )
 
         self.get_logger().info(f"Using namespace /{namespace} for ROS communication")
 
@@ -829,16 +842,14 @@ class IiwaRosInterface(Node):
 
         return command_mode, command_value, new_command
 
-    def PublishReport(
+    def PublishJointStatus(
         self,
-        joint_position_commanded: np.ndarray,
-        joint_position_measured: np.ndarray,
-        joint_velocity_estimated: np.ndarray,
-        joint_torque_commanded: np.ndarray,
-        joint_torque_measured: np.ndarray,
-        joint_torque_external: np.ndarray,
-        cartesian_pose_measured: RigidTransform,
-        cartesian_velocity_estimated: SpatialVelocity,
+        position_commanded: np.ndarray,
+        position_measured: np.ndarray,
+        velocity_estimated: np.ndarray,
+        torque_commanded: np.ndarray,
+        torque_measured: np.ndarray,
+        torque_external: np.ndarray,
     ):
         stamp = self.get_clock().now().to_msg()
         names = [f"joint_{i}" for i in range(1, 8)]
@@ -855,12 +866,20 @@ class IiwaRosInterface(Node):
                 msg.effort = list(effort)
             return msg
 
-        self._joint_position_commanded_pub.publish(MakeMsg(position=joint_position_commanded))
-        self._joint_position_measured_pub.publish(MakeMsg(position=joint_position_measured))
-        self._joint_velocity_estimated_pub.publish(MakeMsg(velocity=joint_velocity_estimated))
-        self._joint_torque_commanded_pub.publish(MakeMsg(effort=joint_torque_commanded))
-        self._joint_torque_measured_pub.publish(MakeMsg(effort=joint_torque_measured))
-        self._joint_torque_external_pub.publish(MakeMsg(effort=joint_torque_external))
+        self._joint_position_commanded_pub.publish(MakeMsg(position=position_commanded))
+        self._joint_position_measured_pub.publish(MakeMsg(position=position_measured))
+        self._joint_velocity_estimated_pub.publish(MakeMsg(velocity=velocity_estimated))
+        self._joint_torque_commanded_pub.publish(MakeMsg(effort=torque_commanded))
+        self._joint_torque_measured_pub.publish(MakeMsg(effort=torque_measured))
+        self._joint_torque_external_pub.publish(MakeMsg(effort=torque_external))
+
+    def PublishCartesianStatus(
+        self,
+        pose_measured: RigidTransform,
+        velocity_estimated: SpatialVelocity,
+        wrench_estimated: SpatialForce,
+    ):
+        stamp = self.get_clock().now().to_msg()
 
         def MakePoseMsg(X_WT: RigidTransform) -> PoseStamped:
             msg = PoseStamped()
@@ -897,8 +916,26 @@ class IiwaRosInterface(Node):
 
             return msg
 
-        self._cartesian_pose_measured_pub.publish(MakePoseMsg(cartesian_pose_measured))
-        self._cartesian_velocity_estimated_pub.publish(MakeTwistMsg(cartesian_velocity_estimated))
+        def MakeWrenchMsg(F_WT: SpatialForce) -> TwistStamped:
+            msg = WrenchStamped()
+            msg.header.stamp = stamp
+
+            torque = F_WT.rotational()
+            force = F_WT.translational()
+
+            msg.wrench.force.x = force[0]
+            msg.wrench.force.y = force[1]
+            msg.wrench.force.z = force[2]
+
+            msg.wrench.torque.x = torque[0]
+            msg.wrench.torque.y = torque[1]
+            msg.wrench.torque.z = torque[2]
+
+            return msg
+
+        self._cartesian_pose_measured_pub.publish(MakePoseMsg(pose_measured))
+        self._cartesian_velocity_estimated_pub.publish(MakeTwistMsg(velocity_estimated))
+        self._cartesian_wrench_estimated_pub.publish(MakeWrenchMsg(wrench_estimated))
 
 
 class RosCommandSource(LeafSystem):
@@ -1058,6 +1095,9 @@ class RosReportSink(LeafSystem):
         self.cartesian_velocity_estimated_input_port = self.DeclareAbstractInputPort(
             "cartesian_velocity_estimated", AbstractValue.Make(SpatialVelocity())
         )
+        self.cartesian_wrench_estimated_input_port = self.DeclareAbstractInputPort(
+            "cartesian_wrench_estimated", AbstractValue.Make(SpatialForce())
+        )
 
         self.DeclarePeriodicPublishEvent(
             period_sec=publish_period,
@@ -1066,15 +1106,18 @@ class RosReportSink(LeafSystem):
         )
 
     def _Publish(self, context):
-        self._ros_interface.PublishReport(
-            joint_position_commanded=self.position_commanded_input_port.Eval(context),
-            joint_position_measured=self.position_measured_input_port.Eval(context),
-            joint_velocity_estimated=self.velocity_estimated_input_port.Eval(context),
-            joint_torque_commanded=self.torque_commanded_input_port.Eval(context),
-            joint_torque_measured=self.torque_measured_input_port.Eval(context),
-            joint_torque_external=self.torque_external_input_port.Eval(context),
-            cartesian_pose_measured=self.cartesian_pose_measured_input_port.Eval(context),
-            cartesian_velocity_estimated=self.cartesian_velocity_estimated_input_port.Eval(context),
+        self._ros_interface.PublishJointStatus(
+            position_commanded=self.position_commanded_input_port.Eval(context),
+            position_measured=self.position_measured_input_port.Eval(context),
+            velocity_estimated=self.velocity_estimated_input_port.Eval(context),
+            torque_commanded=self.torque_commanded_input_port.Eval(context),
+            torque_measured=self.torque_measured_input_port.Eval(context),
+            torque_external=self.torque_external_input_port.Eval(context),
+        )
+        self._ros_interface.PublishCartesianStatus(
+            pose_measured=self.cartesian_pose_measured_input_port.Eval(context),
+            velocity_estimated=self.cartesian_velocity_estimated_input_port.Eval(context),
+            wrench_estimated=self.cartesian_wrench_estimated_input_port.Eval(context),
         )
 
 
@@ -1238,12 +1281,20 @@ class IiwaSystem(Diagram):
             forward_kinamatics.GetInputPort("velocity"),
         )
         builder.Connect(
+            robot.GetOutputPort("torque_external"),
+            forward_kinamatics.GetInputPort("torque"),
+        )
+        builder.Connect(
             forward_kinamatics.GetOutputPort("cartesian_pose"),
             report_sink.GetInputPort("cartesian_pose_measured"),
         )
         builder.Connect(
             forward_kinamatics.GetOutputPort("cartesian_velocity"),
             report_sink.GetInputPort("cartesian_velocity_estimated"),
+        )
+        builder.Connect(
+            forward_kinamatics.GetOutputPort("cartesian_wrench"),
+            report_sink.GetInputPort("cartesian_wrench_estimated"),
         )
 
         builder.BuildInto(self)

@@ -96,11 +96,14 @@ def main():
     )
     ros_thread.start()
 
-    diagram = diagram_builder.Build()
-    simulator = Simulator(diagram)
-    simulator.set_target_realtime_rate(1.0)
-    simulator.Initialize()
-    simulator.AdvanceTo(np.inf)
+    if not diagram_builder.empty():
+        diagram = diagram_builder.Build()
+        simulator = Simulator(diagram)
+        simulator.set_target_realtime_rate(1.0)
+        simulator.Initialize()
+        simulator.AdvanceTo(np.inf)
+    else:
+        print("No systems found, exiting...")
 
 
 if __name__ == "__main__":
