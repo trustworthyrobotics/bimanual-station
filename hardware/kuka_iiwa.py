@@ -189,7 +189,9 @@ class IntegratedVelocitySwitch(LeafSystem):
             num_joints,
         )
 
-        self._position_state_index = self.DeclareDiscreteState(num_joints)
+        self._position_state_index = self.DeclareDiscreteState(
+            np.full(num_joints, np.nan)
+        )
 
         self._active_input_state_index = self.DeclareAbstractState(
             AbstractValue.Make(InputPortIndex(0))
@@ -213,7 +215,7 @@ class IntegratedVelocitySwitch(LeafSystem):
 
         active = self.active_input_port.Eval(context)
 
-        if active != previous_active:
+        if active != previous_active or np.isnan(q).any():
             q = self.position_measured_input_port.Eval(context).copy()
 
         v = self.get_input_port(active).Eval(context)
@@ -513,6 +515,52 @@ def IiwaDifferentialInverseKinematics(
     return diff_ik_system, ee_frame
 
 
+class PassThroughSelector(LeafSystem):
+    """
+    Outputs zero velocity if the input of type RigidTransform or SpatialVelocity has
+    nan. Otherwise input velocity passes throgh to the output velocity.
+    """
+
+    def __init__(
+            self,
+            type: type[SpatialVelocity] | type[RigidTransform],
+            num_joints: int = 7,
+        ):
+        super().__init__()
+
+        self._type = type
+
+        self._selector_input_port = self.DeclareAbstractInputPort(
+            "selector",
+            AbstractValue.Make(type()),
+        )
+
+        self._velocity_input_port = self.DeclareVectorInputPort(
+            "velocity", num_joints
+        )
+
+        self.DeclareVectorOutputPort(
+            "velocity", num_joints, self._CalcOutput
+        )
+
+    def _CalcOutput(self, context, output):
+        if self._type is SpatialVelocity:
+            vel = self._selector_input_port.Eval(context)
+            vel = np.concatenate([vel.rotational(), vel.translational()])
+            output_zero = np.isnan(vel).any() or (vel == 0).all()
+        elif self._type is RigidTransform:
+            pose = self._selector_input_port.Eval(context)
+            output_zero = (
+                np.isnan(pose.translation()).any()
+                or np.isnan(pose.rotation().matrix()).any()
+            )
+
+        if output_zero:
+            output.set_value(np.zeros(self._velocity_input_port.size()))
+        else:
+            output.set_value(self._velocity_input_port.Eval(context))
+
+
 class CartesianVelocityController(Diagram):
     """
     The CartesianVelocityController converts desired end-effector velocity into joint
@@ -568,8 +616,19 @@ class CartesianVelocityController(Diagram):
             "desired_cartesian_velocity",
         )
 
-        builder.ExportOutput(
+        selector = builder.AddSystem(
+            PassThroughSelector(type=SpatialVelocity)
+        )
+        builder.ConnectToSame(
+            vel_bus.GetInputPort(ee_frame),
+            selector.GetInputPort("selector"),
+        )
+        builder.Connect(
             diff_ik.GetOutputPort("commanded_velocity"),
+            selector.GetInputPort("velocity"),
+        )
+        builder.ExportOutput(
+            selector.get_output_port(),
             "commanded_velocity",
         )
 
@@ -633,62 +692,19 @@ class CartesianPoseController(Diagram):
             "desired_cartesian_pose",
         )
 
-        class PoseSelector(LeafSystem):
-            def __init__(self):
-                super().__init__()
-
-                self.DeclareAbstractInputPort(
-                    "pose",
-                    AbstractValue.Make(RigidTransform()),
-                )
-
-                self.DeclareAbstractOutputPort(
-                    "selector",
-                    lambda: AbstractValue.Make(InputPortIndex(2)),
-                    self._CalcOutput,
-                )
-
-            def _CalcOutput(self, context, output):
-                pose = self.get_input_port().Eval(context)
-
-                invalid = (
-                    np.isnan(pose.translation()).any()
-                    or np.isnan(pose.rotation().matrix()).any()
-                )
-
-                output.set_value(InputPortIndex(2 if invalid else 1))
-
-        pose_selector = builder.AddSystem(PoseSelector())
-
+        selector = builder.AddSystem(
+            PassThroughSelector(type=RigidTransform)
+        )
         builder.ConnectToSame(
             pose_bus.GetInputPort(ee_frame),
-            pose_selector.get_input_port(),
+            selector.GetInputPort("selector"),
         )
-
-        switch = PortSwitch(7)
-        switch.DeclareInputPort("velocity_1")
-        switch.DeclareInputPort("velocity_2")
-        switch = builder.AddSystem(switch)
-
-        zero_velocity = builder.AddSystem(ConstantVectorSource(np.zeros(7)))
-
-        builder.Connect(
-            pose_selector.get_output_port(),
-            switch.get_port_selector_input_port(),
-        )
-
         builder.Connect(
             diff_ik.GetOutputPort("commanded_velocity"),
-            switch.get_input_port(1),
+            selector.GetInputPort("velocity"),
         )
-
-        builder.Connect(
-            zero_velocity.get_output_port(),
-            switch.get_input_port(2),
-        )
-
         builder.ExportOutput(
-            switch.get_output_port(),
+            selector.get_output_port(),
             "commanded_velocity",
         )
 
