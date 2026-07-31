@@ -44,6 +44,7 @@ class XboxCartesianVel(Node):
 
         self.prev_a = False
         self.prev_b = False
+        self.prev_zero = False
 
         # Detect connected robots after publishers have had time to match.
         self.detect_timer = self.create_timer(1.0, self.detect_arms)
@@ -104,6 +105,17 @@ class XboxCartesianVel(Node):
         twist.angular.z = angular_scale * msg.axes[3]
         twist.angular.x = angular_scale * msg.axes[6]
         twist.angular.y = angular_scale * msg.axes[7]
+
+        if all([
+            twist.linear.x == 0, twist.linear.y == 0, twist.linear.z == 0,
+            twist.angular.x == 0, twist.angular.y == 0, twist.angular.z == 0,
+        ]):
+            if self.prev_zero:
+                return  # dont send zero command again
+            else:
+                self.prev_zero = True
+        else:
+            self.prev_zero = False
 
         if self.active_arm == ActiveArm.LEFT:
             self.left_iiwa_pub.publish(cmd)
