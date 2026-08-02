@@ -1,5 +1,6 @@
 import threading
 import uuid
+import requests
 
 import rclpy
 from rcl_interfaces.msg import ParameterDescriptor, FloatingPointRange
@@ -7,7 +8,6 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
 from control_msgs.action import GripperCommand
-
 
 from bkstools.bks_lib.bks_base import BKSBase
 from pyschunk.generated.generated_enums import eCmdCode
@@ -155,18 +155,35 @@ class SchunkGripperNode(Node):
             return result
 
 
-def main(args=None):
-    rclpy.init(args=args)
+def CheckHostActive(host: str, port: int = 80, timeout: float = 1.0) -> bool:
+    try:
+        response = requests.get(
+            f"http://{host}:{port}",
+            timeout=timeout,
+        )
+        del response
+        return True
+    except requests.RequestException:
+        return False
 
-    node = SchunkGripperNode(
-        namespace="left_schunk",
-        host="192.170.10.4",
-    )
 
-    executor = rclpy.executors.MultiThreadedExecutor()
-    executor.add_node(node)
-    executor.spin()
+def AddShunkSystems(
+    rclpy_executor: rclpy.executors.Executor,
+):
+    namespaces = ["left_schunk", "right_schunk"]
+    hosts = ["192.170.10.4", "192.170.10.5"]
+    enabled = [CheckHostActive(h) for h in hosts]
 
+    if not any(enabled):
+        print("No Schunk gripper found.")
+        return
 
-if __name__ == "__main__":
-    main()
+    for k in range(len(hosts)):
+        if not enabled[k]:
+            continue
+
+        node = SchunkGripperNode(
+            namespace=namespaces[k],
+            host=hosts[k],
+        )
+        rclpy_executor.add_node(node)

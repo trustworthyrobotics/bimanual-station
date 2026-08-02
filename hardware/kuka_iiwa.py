@@ -1362,7 +1362,7 @@ def AddIiwaSystems(
 
     lcm = AddLcm(diagram_builder)
 
-    for k in range(2):
+    for k in range(len(lcm_channel_suffixs)):
         if not enabled[k]:
             continue
 

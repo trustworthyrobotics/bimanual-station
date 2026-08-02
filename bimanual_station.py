@@ -9,7 +9,7 @@ from pydrake.all import (
     Simulator,
 )
 
-from hardware import AddIiwaSystems
+from hardware import AddIiwaSystems, AddShunkSystems
 
 
 def parse_args():
@@ -77,7 +77,7 @@ def main():
 
     rclpy.init()
 
-    rclpy_executor = rclpy.executors.SingleThreadedExecutor()
+    rclpy_executor = rclpy.executors.MultiThreadedExecutor()
 
     diagram_builder = DiagramBuilder()
 
@@ -89,6 +89,14 @@ def main():
         max_angular_velocity=args.max_angular_vel,
         tool_z_offset=args.tool_z_offset,
     )
+
+    AddShunkSystems(
+        rclpy_executor=rclpy_executor,
+    )
+
+    if len(rclpy_executor.get_nodes()) == 0:
+        print("No systems found, exiting...")
+        exit()
 
     ros_thread = threading.Thread(
         target=rclpy_executor.spin,
@@ -103,7 +111,8 @@ def main():
         simulator.Initialize()
         simulator.AdvanceTo(np.inf)
     else:
-        print("No systems found, exiting...")
+        while True:
+            pass
 
 
 if __name__ == "__main__":
