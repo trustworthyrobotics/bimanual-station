@@ -21,7 +21,7 @@ def parse_args():
         "--max_joint_vel",
         type=float,
         nargs="+",
-        default=[1.0],
+        default=[0.5],
         metavar="VEL",
         help="IIWA robot maximum joint velocity (rad/s). Specify one value or seven values.",
     )
@@ -30,7 +30,7 @@ def parse_args():
         "--max_linear_vel",
         type=float,
         nargs="+",
-        default=[0.5],
+        default=[0.1],
         metavar="VEL",
         help="IIWA robot maximum certesian linear velocity (m/s). Specify one value or three values.",
     )
@@ -39,7 +39,7 @@ def parse_args():
         "--max_angular_vel",
         type=float,
         nargs="+",
-        default=[1.8],
+        default=[0.5],
         metavar="VEL",
         help="IIWA robot maximum certesian angular velocity (rad/s). Specify one value or three values.",
     )

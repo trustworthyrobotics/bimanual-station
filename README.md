@@ -65,14 +65,10 @@ The `bimanual_station.py` script provides ROS 2 topics for commanding the IIWA r
 
 where `<namespace>` is either `left_iiwa` or `right_iiwa`. There are also topics for reporting the joint state and Cartesian state.
 
-The joint velocity limit, Cartesian linear/angular velocity limit, and the tool offset can be configured through command-line arguments:
+The tool z-offset, which defines the point where Cartesian pose and velocity commands are applied, can be configured using the following command-line argument:
 
 ```bash
-bimanual_station.py \
-    [--max_joint_vel VEL [VEL ...]] \
-    [--max_linear_vel VEL [VEL ...]] \
-    [--max_angular_vel VEL [VEL ...]] \
-    [--tool_z_offset OFFSET]
+python bimanual_station.py [--tool_z_offset OFFSET]
 ```
 
 ### `xbox_jogger.py`

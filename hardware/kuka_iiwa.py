@@ -14,11 +14,10 @@ from pydrake.all import (AbstractValue, BusCreator, CollisionCheckerParams,
                          JacobianWrtVariable, JointLimits, LcmInterfaceSystem,
                          LcmPublisherSystem, LcmSubscriberSystem, LeafSystem,
                          ModelInstanceIndex, MultibodyPlant, OutputPort,
-                         Parser, PortSwitch, Quaternion, RigidTransform,
-                         RobotDiagramBuilder, RotationMatrix, Saturation,
-                         SceneGraphCollisionChecker, SpatialForce,
-                         SpatialVelocity, ValueProducer, position_enabled,
-                         torque_enabled)
+                         Parser, Quaternion, RigidTransform, RobotDiagramBuilder,
+                         RotationMatrix, SceneGraphCollisionChecker,
+                         SpatialForce, SpatialVelocity, ValueProducer,
+                         position_enabled, torque_enabled)
 
 import rclpy
 from rclpy.node import Node
@@ -264,15 +263,16 @@ class IntegratedVelocitySwitch(LeafSystem):
     position.
 
     The active velocity input is selected by an InputPortIndex received on an
-    abstract input port. Whenever the selected input changes, the integrator is
-    synchronized to the measured joint position before integration continues.
+    abstract input port.
+
+    The initial joint position is loaded from the position_measured input port.
     """
 
     def __init__(
         self,
-        time_step: float,
         num_velocity_inputs: int,
-        num_joints: int = 7,
+        max_velocity: float | list[float],
+        time_step: float,
     ):
         super().__init__()
 
@@ -281,10 +281,21 @@ class IntegratedVelocitySwitch(LeafSystem):
         plant = MultibodyPlant(0.0)
         AddIiwa7Model(plant, 0.0)
         plant.Finalize()
-        joint_limits = JointLimits(plant)
+        num_joints = plant.num_velocities()
 
-        self._lower = joint_limits.position_lower()
-        self._upper = joint_limits.position_upper()
+        joint_limits = JointLimits(plant)
+        joint_limit_margin = np.deg2rad(10.0)
+
+        self._pos_lower = joint_limits.position_lower() + joint_limit_margin
+        self._pos_upper = joint_limits.position_upper() - joint_limit_margin
+
+        if np.isscalar(max_velocity):
+            max_velocity = np.full(num_joints, max_velocity)
+        max_velocity = np.array(max_velocity)
+        assert max_velocity.shape == (num_joints,)
+
+        self._vel_lower = -max_velocity
+        self._vel_upper = max_velocity
 
         self.active_input_port = self.DeclareAbstractInputPort(
             "active_input",
@@ -304,10 +315,6 @@ class IntegratedVelocitySwitch(LeafSystem):
             num_joints,
         )
 
-        self._active_input_state_index = self.DeclareAbstractState(
-            AbstractValue.Make(InputPortIndex(0))
-        )
-
         self._position_state_index = self.DeclareDiscreteState(
             np.full(num_joints, np.nan)
         )
@@ -324,56 +331,23 @@ class IntegratedVelocitySwitch(LeafSystem):
         )
 
     def _Update(self, context, state):
-        q = context.get_discrete_state(self._position_state_index).value().copy()
+        q = context.get_discrete_state(self._position_state_index).value()
 
-        previous_active = context.get_abstract_state(self._active_input_state_index).get_value()
+        if np.isnan(q).any():
+            q = self.position_measured_input_port.Eval(context)
 
         active = self.active_input_port.Eval(context)
 
-        if active != previous_active or np.isnan(q).any():
-            q = self.position_measured_input_port.Eval(context).copy()
-
         v = self.get_input_port(active).Eval(context)
+        v = np.clip(v, self._vel_lower, self._vel_upper)
+
+        if np.isnan(v).any():
+            v = np.zeros_like(q)
 
         q_next = q + self._time_step * v
-        q_next = np.clip(q_next, self._lower, self._upper)
+        q_next = np.clip(q_next, self._pos_lower, self._pos_upper)
 
         state.get_mutable_discrete_state(self._position_state_index).set_value(q_next)
-
-        state.get_mutable_abstract_state(self._active_input_state_index).set_value(active)
-
-
-class JointVelocityController(Diagram):
-    """
-    Clips desired joint velocities to joint velocity limits.
-    """
-
-    def __init__(
-        self,
-        max_velocity: float | list[float],
-        num_joints: int = 7,
-    ):
-        super().__init__()
-
-        max_velocity = np.asarray(max_velocity, dtype=float)
-        if max_velocity.ndim == 0:
-            max_velocity = np.full(num_joints, float(max_velocity))
-        assert max_velocity.shape == (num_joints,)
-
-        builder = DiagramBuilder()
-
-        saturation = builder.AddSystem(
-            Saturation(
-                min_value=-max_velocity,
-                max_value=max_velocity,
-            )
-        )
-
-        builder.ExportInput(saturation.get_input_port(), "desired_velocity")
-
-        builder.ExportOutput(saturation.get_output_port(), "commanded_velocity")
-
-        builder.BuildInto(self)
 
 
 class JointPositionController(LeafSystem):
@@ -388,18 +362,12 @@ class JointPositionController(LeafSystem):
     def __init__(
         self,
         time_step: float,
-        max_velocity: float | list[float],
+        k_vx: float = 0.5,
         num_joints: int = 7,
     ):
         super().__init__()
-        self._num_joints = num_joints
         self._time_step = time_step
-
-        max_velocity = np.asarray(max_velocity, dtype=float)
-        if max_velocity.ndim == 0:
-            max_velocity = np.full(num_joints, float(max_velocity))
-        assert max_velocity.shape == (num_joints,)
-        self._max_velocity = max_velocity
+        self._k_vx = k_vx
 
         self.position_input_port = self.DeclareVectorInputPort(
             "position", num_joints
@@ -419,11 +387,7 @@ class JointPositionController(LeafSystem):
         if np.any(np.isnan(desired_position)):
             desired_position = position
 
-        velocity = np.clip(
-            (desired_position - position) / self._time_step,
-            -self._max_velocity,
-            self._max_velocity,
-        )
+        velocity = self._k_vx * (desired_position - position) / self._time_step
         output.SetFromVector(velocity)
 
 
@@ -432,13 +396,15 @@ def IiwaDifferentialInverseKinematics(
         time_step: float,
         max_linear_velocity: float | list[float],
         max_angular_velocity: float | list[float],
+        K_VX: float = 0.5,
     ) -> tuple[DifferentialInverseKinematicsSystem, str]:
 
     if np.isscalar(max_linear_velocity):
-        max_linear_velocity = np.ones(3) * max_linear_velocity / np.sqrt(3)
+        max_linear_velocity = np.full(3, max_linear_velocity / np.sqrt(3))
     if np.isscalar(max_angular_velocity):
-        max_angular_velocity = np.ones(3) * max_angular_velocity / np.sqrt(3)
+        max_angular_velocity = np.full(3, max_angular_velocity / np.sqrt(3))
     max_cartesian_velocity = np.concatenate([max_angular_velocity, max_linear_velocity])
+    assert max_cartesian_velocity.shape == (6,)
 
     robot_builder = RobotDiagramBuilder()
 
@@ -501,7 +467,7 @@ def IiwaDifferentialInverseKinematics(
         collision_checker=collision_checker,
         active_dof=active_dof,
         time_step=time_step,
-        K_VX=1.0,
+        K_VX=K_VX,
         Vd_TG_limit=SpatialVelocity(max_cartesian_velocity),
     )
 
@@ -1165,6 +1131,7 @@ class IiwaSystem(Diagram):
         integrated_velocity = builder.AddSystem(
             IntegratedVelocitySwitch(
                 num_velocity_inputs=4,
+                max_velocity=max_joint_velocity,
                 time_step=time_step,
             )
         )
@@ -1185,25 +1152,15 @@ class IiwaSystem(Diagram):
             integrated_velocity.GetInputPort("active_input"),
         )
 
-        # Joint velocity controller
-        joint_vel_controller = builder.AddSystem(
-            JointVelocityController(max_velocity=max_joint_velocity)
-        )
+        # Joint velocity control
         builder.Connect(
             command_source.GetOutputPort("desired_joint_velocity"),
-            joint_vel_controller.GetInputPort("desired_velocity"),
-        )
-        builder.Connect(
-            joint_vel_controller.GetOutputPort("commanded_velocity"),
             integrated_velocity.get_input_port(1),
         )
 
         # Joint position controller
         joint_pos_controller = builder.AddSystem(
-            JointPositionController(
-                time_step=time_step,
-                max_velocity=max_joint_velocity,
-            )
+            JointPositionController(time_step=time_step)
         )
         builder.Connect(
             integrated_velocity.GetOutputPort("position"),
@@ -1343,9 +1300,9 @@ def AddIiwaSystems(
     diagram_builder: DiagramBuilder,
     rclpy_executor: rclpy.executors.Executor,
     tool_z_offset: float = 0.0,
-    max_joint_velocity: float | list[float] = 1.0,
-    max_linear_velocity: float | list[float] = 0.5,
-    max_angular_velocity: float | list[float] = 1.8,
+    max_joint_velocity: float | list[float] = 0.5,
+    max_linear_velocity: float | list[float] = 0.1,
+    max_angular_velocity: float | list[float] = 0.5,
 ) -> None:
 
     ros_namespaces = ["left_iiwa", "right_iiwa"]
