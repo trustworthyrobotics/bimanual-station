@@ -36,7 +36,6 @@ On the host computer, launch the driver for the desired robot:
 **Left IIWA**
 ```bash
 ./iiwa_driver \
-    --fri_ip 192.170.10.2 \
     --fri_port 30200 \
     --lcm_command_channel IIWA_COMMAND \
     --lcm_status_channel IIWA_STATUS
@@ -45,7 +44,6 @@ On the host computer, launch the driver for the desired robot:
 **Right IIWA**
 ```bash
 ./iiwa_driver \
-    --fri_ip 192.170.10.3 \
     --fri_port 30201 \
     --lcm_command_channel IIWA_COMMAND_2 \
     --lcm_status_channel IIWA_STATUS_2
