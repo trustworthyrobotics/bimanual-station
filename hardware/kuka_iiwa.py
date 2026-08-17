@@ -323,8 +323,8 @@ class IntegratedVelocitySwitch(LeafSystem):
             for i in range(num_velocity_inputs)
         ]
 
-        self.position_measured_input_port = self.DeclareVectorInputPort(
-            "position_measured",
+        self.position_reset_input_port = self.DeclareVectorInputPort(
+            "position_reset",
             num_joints,
         )
 
@@ -347,7 +347,7 @@ class IntegratedVelocitySwitch(LeafSystem):
         q = context.get_discrete_state(self._position_state_index).value()
 
         if np.isnan(q).any():
-            q = self.position_measured_input_port.Eval(context)
+            q = self.position_reset_input_port.Eval(context)
 
         active = self.active_input_port.Eval(context)
 
@@ -1172,8 +1172,8 @@ class IiwaSystem(Diagram):
             robot.GetInputPort("position"),
         )
         builder.Connect(
-            robot.GetOutputPort("position_measured"),
-            integrated_velocity.GetInputPort("position_measured"),
+            robot.GetOutputPort("position_commanded"),
+            integrated_velocity.GetInputPort("position_reset"),
         )
 
         command_source = builder.AddSystem(
