@@ -136,7 +136,9 @@ class IiwaRobot(Diagram):
 
 def AddIiwa7Model(
         plant: MultibodyPlant,
-        end_effector_z_offset: float
+        end_effector_z_offset: float,
+        joint_position_margin: np.ndarray | None = None,
+        max_joint_velocity: np.ndarray | None = None,
     ) -> tuple[ModelInstanceIndex, Frame]:
 
     iiwa_instance = Parser(plant).AddModelsFromUrl(
@@ -156,6 +158,23 @@ def AddIiwa7Model(
             X_PF=RigidTransform([0.0, 0.0, end_effector_z_offset]),
         )
     )
+
+    if joint_position_margin is not None:
+        assert joint_position_margin.shape == (7,)
+        assert (joint_position_margin > 0).all()
+    if max_joint_velocity is not None:
+        assert max_joint_velocity.shape == (7,)
+        assert (max_joint_velocity > 0).all()
+
+    for i in range(7):
+        joint = plant.GetJointByName(f"iiwa_joint_{i+1}", iiwa_instance)
+        if joint_position_margin is not None:
+            joint.set_position_limits(
+                joint.position_lower_limits() + joint_position_margin[i],
+                joint.position_upper_limits() - joint_position_margin[i],
+            )
+        if max_joint_velocity is not None:
+            joint.set_velocity_limits([-max_joint_velocity[i]], [max_joint_velocity[i]])
 
     return iiwa_instance, ee_frame
 
@@ -271,7 +290,8 @@ class IntegratedVelocitySwitch(LeafSystem):
     def __init__(
         self,
         num_velocity_inputs: int,
-        max_velocity: float | list[float],
+        max_velocity: np.ndarray,
+        position_margin: np.ndarray,
         time_step: float,
     ):
         super().__init__()
@@ -279,23 +299,16 @@ class IntegratedVelocitySwitch(LeafSystem):
         self._time_step = time_step
 
         plant = MultibodyPlant(0.0)
-        AddIiwa7Model(plant, 0.0)
+        AddIiwa7Model(
+            plant=plant,
+            end_effector_z_offset=0.0,
+            joint_position_margin=position_margin,
+            max_joint_velocity=max_velocity,
+        )
         plant.Finalize()
         num_joints = plant.num_velocities()
 
-        joint_limits = JointLimits(plant)
-        joint_limit_margin = np.deg2rad(10.0)
-
-        self._pos_lower = joint_limits.position_lower() + joint_limit_margin
-        self._pos_upper = joint_limits.position_upper() - joint_limit_margin
-
-        if np.isscalar(max_velocity):
-            max_velocity = np.full(num_joints, max_velocity)
-        max_velocity = np.array(max_velocity)
-        assert max_velocity.shape == (num_joints,)
-
-        self._vel_lower = -max_velocity
-        self._vel_upper = max_velocity
+        self._joint_limits = JointLimits(plant)
 
         self.active_input_port = self.DeclareAbstractInputPort(
             "active_input",
@@ -339,13 +352,21 @@ class IntegratedVelocitySwitch(LeafSystem):
         active = self.active_input_port.Eval(context)
 
         v = self.get_input_port(active).Eval(context)
-        v = np.clip(v, self._vel_lower, self._vel_upper)
+        v = np.clip(
+            v,
+            self._joint_limits.velocity_lower(),
+            self._joint_limits.velocity_upper(),
+        )
 
         if np.isnan(v).any():
             v = np.zeros_like(q)
 
         q_next = q + self._time_step * v
-        q_next = np.clip(q_next, self._pos_lower, self._pos_upper)
+        q_next = np.clip(
+            q_next,
+            self._joint_limits.position_lower(),
+            self._joint_limits.position_upper(),
+        )
 
         state.get_mutable_discrete_state(self._position_state_index).set_value(q_next)
 
@@ -394,23 +415,24 @@ class JointPositionController(LeafSystem):
 def IiwaDifferentialInverseKinematics(
         end_effector_z_offset: float,
         time_step: float,
-        max_linear_velocity: float | list[float],
-        max_angular_velocity: float | list[float],
+        max_linear_velocity: np.ndarray,
+        max_angular_velocity: np.ndarray,
+        max_joint_velocity: np.ndarray | None = None,
+        joint_position_margin: np.ndarray | None = None,
         K_VX: float = 0.5,
     ) -> tuple[DifferentialInverseKinematicsSystem, str]:
 
-    if np.isscalar(max_linear_velocity):
-        max_linear_velocity = np.full(3, max_linear_velocity / np.sqrt(3))
-    if np.isscalar(max_angular_velocity):
-        max_angular_velocity = np.full(3, max_angular_velocity / np.sqrt(3))
     max_cartesian_velocity = np.concatenate([max_angular_velocity, max_linear_velocity])
     assert max_cartesian_velocity.shape == (6,)
+    assert (max_cartesian_velocity > 0).all()
 
     robot_builder = RobotDiagramBuilder()
 
     iiwa_instance, ee_frame = AddIiwa7Model(
         plant=robot_builder.plant(),
         end_effector_z_offset=end_effector_z_offset,
+        joint_position_margin=joint_position_margin,
+        max_joint_velocity=max_joint_velocity,
     )
 
     robot_diagram = robot_builder.Build()
@@ -530,8 +552,10 @@ class CartesianVelocityController(Diagram):
         self,
         end_effector_z_offset: float,
         time_step: float,
-        max_linear_velocity: float | list[float],
-        max_angular_velocity: float | list[float],
+        max_linear_velocity: np.ndarray,
+        max_angular_velocity: np.ndarray,
+        max_joint_velocity: np.ndarray | None = None,
+        joint_position_margin: np.ndarray | None = None,
     ):
         super().__init__()
 
@@ -542,6 +566,8 @@ class CartesianVelocityController(Diagram):
             time_step=time_step,
             max_linear_velocity=max_linear_velocity,
             max_angular_velocity=max_angular_velocity,
+            max_joint_velocity=max_joint_velocity,
+            joint_position_margin=joint_position_margin,
         )
         diff_ik = builder.AddSystem(diff_ik)
 
@@ -605,8 +631,10 @@ class CartesianPoseController(Diagram):
         self,
         end_effector_z_offset: float,
         time_step: float,
-        max_linear_velocity: float | list[float],
-        max_angular_velocity: float | list[float],
+        max_linear_velocity: np.ndarray,
+        max_angular_velocity: np.ndarray,
+        max_joint_velocity: np.ndarray | None = None,
+        joint_position_margin: np.ndarray | None = None,
     ):
         super().__init__()
 
@@ -617,6 +645,8 @@ class CartesianPoseController(Diagram):
             time_step=time_step,
             max_linear_velocity=max_linear_velocity,
             max_angular_velocity=max_angular_velocity,
+            max_joint_velocity=max_joint_velocity,
+            joint_position_margin=joint_position_margin,
         )
         diff_ik = builder.AddSystem(diff_ik)
 
@@ -1111,9 +1141,10 @@ class IiwaSystem(Diagram):
         lcm: DrakeLcmInterface,
         lcm_channel_suffix: str,
         ros_interface: IiwaRosInterface,
-        max_joint_velocity: float | list[float],
-        max_linear_velocity: float | list[float],
-        max_angular_velocity: float | list[float],
+        max_joint_velocity: np.ndarray,
+        max_linear_velocity: np.ndarray,
+        max_angular_velocity: np.ndarray,
+        joint_position_margin: np.ndarray,
         time_step: float,
         end_effector_z_offset: float,
     ):
@@ -1132,6 +1163,7 @@ class IiwaSystem(Diagram):
             IntegratedVelocitySwitch(
                 num_velocity_inputs=4,
                 max_velocity=max_joint_velocity,
+                position_margin=joint_position_margin,
                 time_step=time_step,
             )
         )
@@ -1182,6 +1214,8 @@ class IiwaSystem(Diagram):
                 time_step=time_step,
                 max_linear_velocity=max_linear_velocity,
                 max_angular_velocity=max_angular_velocity,
+                max_joint_velocity=max_joint_velocity,
+                joint_position_margin=joint_position_margin,
             )
         )
         builder.Connect(
@@ -1204,6 +1238,8 @@ class IiwaSystem(Diagram):
                 time_step=time_step,
                 max_linear_velocity=max_linear_velocity,
                 max_angular_velocity=max_angular_velocity,
+                max_joint_velocity=max_joint_velocity,
+                joint_position_margin=joint_position_margin,
             )
         )
         builder.Connect(
@@ -1317,6 +1353,26 @@ def AddIiwaSystems(
         print("No IIWA robot found.")
         return
 
+    if np.isscalar(max_joint_velocity):
+        max_joint_velocity = np.full(7, max_joint_velocity)
+    max_joint_velocity = np.array(max_joint_velocity)
+    assert max_joint_velocity.shape == (7,), "max_joint_velocity must have 7 values"
+    assert (max_joint_velocity > 0).all(), "max_joint_velocity must be positive"
+
+    if np.isscalar(max_linear_velocity):
+        max_linear_velocity = np.full(3, max_linear_velocity / np.sqrt(3))
+    max_linear_velocity = np.array(max_linear_velocity)
+    assert max_linear_velocity.shape == (3,), "max_linear_velocity must have 3 values"
+    assert (max_linear_velocity > 0).all(), "max_linear_velocity must be positive"
+
+    if np.isscalar(max_angular_velocity):
+        max_angular_velocity = np.full(3, max_angular_velocity / np.sqrt(3))
+    max_angular_velocity = np.array(max_angular_velocity)
+    assert max_angular_velocity.shape == (3,), "max_angular_velocity must have 3 values"
+    assert (max_angular_velocity > 0).all(), "max_angular_velocity must be positive"
+
+    joint_position_margin = np.full(7, np.deg2rad(10))
+
     lcm = AddLcm(diagram_builder)
 
     for k in range(len(lcm_channel_suffixs)):
@@ -1335,6 +1391,7 @@ def AddIiwaSystems(
                 max_joint_velocity=max_joint_velocity,
                 max_linear_velocity=max_linear_velocity,
                 max_angular_velocity=max_angular_velocity,
+                joint_position_margin=joint_position_margin,
                 time_step=0.005,
             )
         )
